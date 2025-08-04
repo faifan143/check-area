@@ -68,8 +68,8 @@ const Canvas: React.FC<CanvasProps> = ({
       // Import the PDF converter utility
       const { PDFConverter } = await import('../utils/pdfConverter');
 
-      // Use PDF.js approach for better browser compatibility
-      const result = await PDFConverter.convertPDFToSVGWithPDFJS(file);
+      // Use the main conversion method which handles errors gracefully
+      const result = await PDFConverter.convertPDFToSVG(file);
 
       const blob = new Blob([result.svgString], { type: 'image/svg+xml' });
       const url = URL.createObjectURL(blob);
@@ -320,8 +320,8 @@ const Canvas: React.FC<CanvasProps> = ({
   const findBoundaryFromFilledPixels = (filledPixels: Array<{ x: number, y: number }>): number[] => {
     if (filledPixels.length === 0) return [];
 
-    // For very small areas, use a more detailed approach
-    if (filledPixels.length <= 200) {
+    // For very small areas, use a more detailed approach with better corner detection
+    if (filledPixels.length <= 300) { // Increased threshold for better corner detection
       return createDetailedBoundaryForSmallArea(filledPixels);
     }
 
@@ -371,15 +371,19 @@ const Canvas: React.FC<CanvasProps> = ({
     const filledSet = new Set<string>();
     filledPixels.forEach(p => filledSet.add(`${p.x},${p.y}`));
 
-    // Find all boundary pixels with 4-directional connectivity for more precision
+    // Find all boundary pixels with 8-directional connectivity for small areas to catch corners
     const boundaryPixels: Array<{ x: number, y: number }> = [];
 
     filledPixels.forEach(pixel => {
       const neighbors = [
-        { x: pixel.x + 1, y: pixel.y },
-        { x: pixel.x - 1, y: pixel.y },
-        { x: pixel.x, y: pixel.y + 1 },
-        { x: pixel.x, y: pixel.y - 1 }
+        { x: pixel.x + 1, y: pixel.y },     // right
+        { x: pixel.x - 1, y: pixel.y },     // left
+        { x: pixel.x, y: pixel.y + 1 },     // down
+        { x: pixel.x, y: pixel.y - 1 },     // up
+        { x: pixel.x + 1, y: pixel.y + 1 }, // diagonal down-right
+        { x: pixel.x + 1, y: pixel.y - 1 }, // diagonal up-right
+        { x: pixel.x - 1, y: pixel.y + 1 }, // diagonal down-left
+        { x: pixel.x - 1, y: pixel.y - 1 }  // diagonal up-left
       ];
 
       // Check if any neighbor is not filled (i.e., this pixel is on the boundary)
@@ -395,7 +399,7 @@ const Canvas: React.FC<CanvasProps> = ({
     if (boundaryPixels.length === 0) return [];
 
     // For very small areas, preserve all boundary pixels without simplification
-    if (boundaryPixels.length <= 30) {
+    if (boundaryPixels.length <= 50) { // Increased threshold for better corner detection
       // Sort boundary pixels in a more natural order (clockwise from top-left)
       const sortedPixels = boundaryPixels.sort((a, b) => {
         if (a.y !== b.y) return a.y - b.y;
@@ -429,16 +433,20 @@ const Canvas: React.FC<CanvasProps> = ({
     const boundarySet = new Set<string>();
     boundaryPixels.forEach(p => boundarySet.add(`${p.x},${p.y}`));
 
-    // Trace the boundary in clockwise order
+    // Trace the boundary in clockwise order with 8-directional connectivity for better corner detection
     const tracedPoints: Array<{ x: number, y: number }> = [];
     const visited = new Set<string>();
 
     let currentPixel = startPixel;
     const directions = [
-      [0, -1],  // up
-      [1, 0],   // right
-      [0, 1],   // down
-      [-1, 0]   // left
+      [0, -1],   // up
+      [1, -1],   // up-right
+      [1, 0],    // right
+      [1, 1],    // down-right
+      [0, 1],    // down
+      [-1, 1],   // down-left
+      [-1, 0],   // left
+      [-1, -1]   // up-left
     ];
 
     do {
@@ -571,17 +579,21 @@ const Canvas: React.FC<CanvasProps> = ({
       visited.add(key);
       boundaryPoints.push({ x: currentX + minX, y: currentY + minY });
 
-      // Try to find the next boundary pixel in clockwise order (4-directional only)
+      // Try to find the next boundary pixel in clockwise order (8-directional for better corner detection)
       const directions = [
-        [1, 0],   // right
-        [0, 1],   // down
-        [-1, 0],  // left
-        [0, -1]   // up
+        [1, 0],    // right
+        [1, 1],    // down-right
+        [0, 1],    // down
+        [-1, 1],   // down-left
+        [-1, 0],   // left
+        [-1, -1],  // up-left
+        [0, -1],   // up
+        [1, -1]    // up-right
       ];
 
       let nextFound = false;
-      for (let i = 0; i < 4; i++) {
-        const testDir = (direction + i) % 4;
+      for (let i = 0; i < 8; i++) {
+        const testDir = (direction + i) % 8;
         const [dx, dy] = directions[testDir];
         const nextX = currentX + dx;
         const nextY = currentY + dy;
@@ -615,9 +627,9 @@ const Canvas: React.FC<CanvasProps> = ({
   const simplifyBoundary = (points: Array<{ x: number, y: number }>): Array<{ x: number, y: number }> => {
     if (points.length <= 3) return points;
 
-    // For very small areas, use minimal or no simplification
-    if (points.length <= 30) {
-      // For tiny areas, just remove exact duplicates
+    // For very small areas, use minimal or no simplification to preserve corner details
+    if (points.length <= 50) { // Increased threshold for better corner preservation
+      // For small areas, just remove exact duplicates and very close points
       const simplified: Array<{ x: number, y: number }> = [points[0]];
       for (let i = 1; i < points.length; i++) {
         const lastPoint = simplified[simplified.length - 1];
@@ -628,7 +640,7 @@ const Canvas: React.FC<CanvasProps> = ({
           Math.pow(currentPoint.x - lastPoint.x, 2) + Math.pow(currentPoint.y - lastPoint.y, 2)
         );
 
-        if (distance > 0.5) { // Even smaller tolerance for small areas
+        if (distance > 0.3) { // Even smaller tolerance for small areas to preserve corners
           simplified.push(currentPoint);
         }
       }
@@ -641,7 +653,7 @@ const Canvas: React.FC<CanvasProps> = ({
           Math.pow(lastPoint.x - firstPoint.x, 2) + Math.pow(lastPoint.y - firstPoint.y, 2)
         );
 
-        if (distance > 0.5) {
+        if (distance > 0.3) {
           simplified.push(firstPoint);
         }
       }

@@ -1,4 +1,5 @@
 // PDF to SVG conversion utility using PDF.js for browser compatibility
+// Client-side only implementation
 
 export interface ConversionResult {
   svgString: string;
@@ -6,14 +7,48 @@ export interface ConversionResult {
   height: number;
 }
 
+// Lazily load pdfjs-dist only on the client side
+let pdfjsPromise: Promise<any> | null = null;
+
+function getPdfjsLib() {
+  if (typeof window === 'undefined') {
+    return Promise.reject(new Error('PDF.js cannot be loaded on the server.'));
+  }
+
+  if (!pdfjsPromise) {
+    pdfjsPromise = (async () => {
+      let pdfjsLib;
+      try {
+        pdfjsLib = await import('pdfjs-dist');
+
+        if (pdfjsLib.GlobalWorkerOptions) {
+          try {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+          } catch (workerError) {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          }
+        }
+      } catch (importError) {
+        console.error('Failed to import pdfjs-dist:', importError);
+        throw new Error('PDF.js library could not be loaded');
+      }
+      return pdfjsLib;
+    })();
+  }
+  return pdfjsPromise;
+}
+
 export class PDFConverter {
   static async convertPDFToSVG(file: File): Promise<ConversionResult> {
+    // Ensure we're on client side
+    if (typeof window === 'undefined') {
+      throw new Error('PDFConverter can only be used on the client side');
+    }
+
     try {
-      // Use PDF.js approach for browser compatibility
       return await this.convertPDFToSVGWithPDFJS(file);
     } catch (error) {
       console.error('PDF conversion failed:', error);
-      // Fallback to demo SVG
       return this.createDemoSVG();
     }
   }
@@ -84,10 +119,13 @@ export class PDFConverter {
 
   // PDF.js approach for real PDF processing
   static async convertPDFToSVGWithPDFJS(file: File): Promise<ConversionResult> {
+    // Ensure we're on client side
+    if (typeof window === 'undefined') {
+      throw new Error('PDFConverter can only be used on the client side');
+    }
+
     try {
-      // Load PDF.js
-      const pdfjsLib = await import('pdfjs-dist');
-      pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
+      const pdfjsLib = await getPdfjsLib(); // Await the promise here
 
       // Load the PDF document
       const arrayBuffer = await file.arrayBuffer();
@@ -125,7 +163,7 @@ export class PDFConverter {
       };
     } catch (error) {
       console.error('PDF.js conversion failed:', error);
-      return this.createDemoSVG();
+      return this.createFallbackSVG();
     }
   }
 
@@ -160,4 +198,4 @@ export class PDFConverter {
       height: 600
     };
   }
-} 
+}
