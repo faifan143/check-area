@@ -10,19 +10,17 @@ pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/$
 
 export default function PdfColorizer() {
     const [file, setFile] = useState<File | null>(null);
-    const [selectedColor, setSelectedColor] = useState("rgba(255, 0, 0, 0.3)");
     const [zoom, setZoom] = useState(100); // 100% = 1x zoom
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [isPanning, setIsPanning] = useState(false);
     const [lastPanPoint, setLastPanPoint] = useState({ x: 0, y: 0 });
 
-    const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
 
     // Add proper wheel event listener to prevent console errors
     useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
+        const container = containerRef.current;
+        if (!container) return;
 
         const handleWheelEvent = (e: WheelEvent) => {
             e.preventDefault();
@@ -40,10 +38,10 @@ export default function PdfColorizer() {
             }
         };
 
-        canvas.addEventListener('wheel', handleWheelEvent, { passive: false });
+        container.addEventListener('wheel', handleWheelEvent, { passive: false });
 
         return () => {
-            canvas.removeEventListener('wheel', handleWheelEvent);
+            container.removeEventListener('wheel', handleWheelEvent);
         };
     }, []);
 
@@ -69,14 +67,14 @@ export default function PdfColorizer() {
         setZoom(prev => Math.max(10, prev - 10));
     };
 
-    const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
         if (e.button === 0) { // Left click for panning
             setIsPanning(true);
             setLastPanPoint({ x: e.clientX, y: e.clientY });
         }
     };
 
-    const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
         if (isPanning) {
             const deltaX = e.clientX - lastPanPoint.x;
             const deltaY = e.clientY - lastPanPoint.y;
@@ -94,29 +92,6 @@ export default function PdfColorizer() {
         setIsPanning(false);
     };
 
-
-
-    const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-        if (isPanning) return; // Don't draw while panning
-
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-
-        // Calculate the actual position considering zoom and pan
-        const rect = canvas.getBoundingClientRect();
-        const x = e.clientX - rect.left - pan.x;
-        const y = e.clientY - rect.top - pan.y;
-
-        // Draw directly on the scaled canvas
-        ctx.fillStyle = selectedColor;
-        ctx.beginPath();
-        ctx.arc(x, y, 10 * (zoom / 100), 0, 2 * Math.PI);
-        ctx.fill();
-    };
-
     // Calculate scaled dimensions for high quality rendering
     const baseWidth = 600;
     const baseHeight = 850;
@@ -130,7 +105,7 @@ export default function PdfColorizer() {
 
     return (
         <div className="p-4 space-y-4">
-            <h1 className="text-2xl font-bold">PDF Plan Colorizer</h1>
+            <h1 className="text-2xl font-bold">PDF Viewer</h1>
 
             <input
                 type="file"
@@ -140,14 +115,6 @@ export default function PdfColorizer() {
             />
 
             <div className="flex items-center gap-4 flex-wrap">
-                <div className="flex items-center gap-2">
-                    <label className="text-sm">Select color:</label>
-                    <input
-                        type="color"
-                        onChange={(e) => setSelectedColor(e.target.value + "33")}
-                    />
-                </div>
-
                 <div className="flex items-center gap-2">
                     <label className="text-sm">Zoom: {zoom}%</label>
                     <input
@@ -189,6 +156,10 @@ export default function PdfColorizer() {
                             height: '600px',
                             cursor: isPanning ? 'grabbing' : 'grab'
                         }}
+                        onMouseDown={handleMouseDown}
+                        onMouseMove={handleMouseMove}
+                        onMouseUp={handleMouseUp}
+                        onMouseLeave={handleMouseUp}
                     >
                         <div
                             style={{
@@ -200,24 +171,6 @@ export default function PdfColorizer() {
                             <Document file={file}>
                                 <Page pageNumber={1} width={scaledWidth} />
                             </Document>
-
-                            {/* Overlay Canvas */}
-                            <canvas
-                                ref={canvasRef}
-                                width={scaledWidth}
-                                height={scaledHeight}
-                                onClick={handleCanvasClick}
-                                onMouseDown={handleMouseDown}
-                                onMouseMove={handleMouseMove}
-                                onMouseUp={handleMouseUp}
-                                onMouseLeave={handleMouseUp}
-                                className="absolute top-0 left-0 z-10"
-                                style={{
-                                    cursor: isPanning ? 'grabbing' : 'crosshair',
-                                    width: `${scaledWidth}px`,
-                                    height: `${scaledHeight}px`
-                                }}
-                            />
                         </div>
                     </div>
                 </div>
