@@ -69,8 +69,9 @@ export default function SimplePdfViewer() {
 
     // Drawing state
     const [drawingMode, setDrawingMode] = useState<'circle' | 'rectangle' | 'polygon' | 'line' | 'fill' | null>(null);
-    // Single mode: draw + select combined. We keep state for backward compatibility.
+    // Single mode: draw + select combined. Draw can be toggled on/off for panning.
     const [currentMode, setCurrentMode] = useState<'draw' | 'select'>('draw');
+    const [drawEnabled, setDrawEnabled] = useState<boolean>(false);
     const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
     const [shapes, setShapes] = useState<Shape[]>([]);
     const [fillColor, setFillColor] = useState<string>('#ffeb3b'); // Default fill color (yellow)
@@ -134,11 +135,19 @@ export default function SimplePdfViewer() {
         setSelections([]);
     };
 
+    const deleteSelectedShape = () => {
+        if (!selectedShapeId) return;
+        setShapes(prev => prev.filter(s => s.id !== selectedShapeId));
+        setSelectedShapeId(null);
+    };
+
     // Drawing functions
     const handleModeChange = (mode: 'draw' | 'select') => {
         setCurrentMode(mode);
-        // With unified mode, keep behavior minimal
-        if (mode !== 'draw') setDrawingMode(null);
+        if (mode !== 'draw') {
+            setDrawingMode(null);
+            setDrawEnabled(false);
+        }
     };
 
     const handleShapeSelect = (shapeId: string | null) => {
@@ -242,21 +251,11 @@ export default function SimplePdfViewer() {
         }
 
         // Handle drawing mode
-        if (!drawingMode || draggingShape || isFloodFilling) return;
+        if (!drawEnabled || !drawingMode || draggingShape || isFloodFilling) return;
 
-        // Handle flood fill mode
+        // Handle flood fill mode on original PDF (dynamic fill)
         if (drawingMode === 'fill') {
-            // For now, just create a simple filled area
-            const newShape: Shape = {
-                id: `shape_${Date.now()}`,
-                type: 'filled-area',
-                points: [pdfPoint.x - 20, pdfPoint.y - 20, pdfPoint.x + 20, pdfPoint.y - 20, pdfPoint.x + 20, pdfPoint.y + 20, pdfPoint.x - 20, pdfPoint.y + 20],
-                color: fillColor,
-                strokeWidth: 0,
-                fillColor: fillColor,
-                filled: true
-            };
-            setShapes([...shapes, newShape]);
+            performPdfDynamicFill({ x: pdfPoint.x, y: pdfPoint.y });
             return;
         }
 
@@ -326,6 +325,177 @@ export default function SimplePdfViewer() {
             setIsDrawing(true);
         }
     }, [drawingMode, drawingPoints, shapes, draggingShape, currentMode, isPointInShape, isFloodFilling, fillColor, pan, zoom]);
+
+    // ===== Dynamic Fill (original PDF content) =====
+    const getUnderlyingPdfCanvas = (): HTMLCanvasElement | null => {
+        const root = containerRef.current;
+        if (!root) return null;
+        const canvases = Array.from(root.querySelectorAll('canvas')) as HTMLCanvasElement[];
+        // Our overlay is canvasRef.current; pick a different one (the PDF render canvas)
+        const pdfCanvas = canvases.find(c => c !== canvasRef.current) || null;
+        return pdfCanvas;
+    };
+
+    const getPixelColor = (data: Uint8ClampedArray, x: number, y: number, width: number): number[] => {
+        const clampedX = Math.max(0, Math.min(Math.floor(x), width - 1));
+        const clampedY = Math.max(0, Math.min(Math.floor(y), (data.length / 4) / width - 1));
+        const idx = (clampedY * width + clampedX) * 4;
+        return [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+    };
+
+    const colorsMatch = (c1: number[], c2: number[], tol = 6): boolean => {
+        return Math.abs(c1[0] - c2[0]) <= tol && Math.abs(c1[1] - c2[1]) <= tol && Math.abs(c1[2] - c2[2]) <= tol;
+    };
+
+    const isDarkPixel = (color: number[], threshold = 120): boolean => {
+        const brightness = (color[0] + color[1] + color[2]) / 3;
+        return brightness < threshold;
+    };
+
+    const traceBoundaryWithMarchingSquares = (boundaryPixels: Array<{ x: number, y: number }>): number[] => {
+        if (boundaryPixels.length === 0) return [];
+        const minX = Math.min(...boundaryPixels.map(p => p.x));
+        const maxX = Math.max(...boundaryPixels.map(p => p.x));
+        const minY = Math.min(...boundaryPixels.map(p => p.y));
+        const maxY = Math.max(...boundaryPixels.map(p => p.y));
+        const width = maxX - minX + 1;
+        const height = maxY - minY + 1;
+        const grid: boolean[][] = Array(height).fill(null).map(() => Array(width).fill(false));
+        boundaryPixels.forEach(p => {
+            const gx = p.x - minX;
+            const gy = p.y - minY;
+            if (gx >= 0 && gx < width && gy >= 0 && gy < height) grid[gy][gx] = true;
+        });
+        let startX = 0, startY = 0; let found = false;
+        for (let y = 0; y < height && !found; y++) {
+            for (let x = 0; x < width && !found; x++) {
+                if (grid[y][x]) { startX = x; startY = y; found = true; }
+            }
+        }
+        if (!found) return [];
+        const points: Array<{ x: number, y: number }> = [];
+        const visited = new Set<string>();
+        let cx = startX, cy = startY; let dir = 0; // 0 right
+        const dirs = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+        while (points.length < boundaryPixels.length * 2) {
+            const key = `${cx},${cy}`;
+            if (visited.has(key)) break;
+            visited.add(key);
+            points.push({ x: cx + minX, y: cy + minY });
+            let nextFound = false;
+            for (let i = 0; i < 8; i++) {
+                const t = (dir + i) % 8; const [dx, dy] = dirs[t];
+                const nx = cx + dx, ny = cy + dy;
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height && grid[ny][nx]) { cx = nx; cy = ny; dir = t; nextFound = true; break; }
+            }
+            if (!nextFound) break;
+        }
+        // simple simplification by skipping very close points
+        const simplified: Array<{ x: number, y: number }> = [];
+        const tol = Math.max(1, Math.floor(points.length / 200));
+        for (const p of points) {
+            const last = simplified[simplified.length - 1];
+            if (!last || Math.hypot(p.x - last.x, p.y - last.y) > tol) simplified.push(p);
+        }
+        const result: number[] = [];
+        simplified.forEach(p => { result.push(p.x, p.y); });
+        return result;
+    };
+
+    const performPdfDynamicFill = async (pdfPoint: { x: number; y: number }) => {
+        const pdfCanvas = getUnderlyingPdfCanvas();
+        if (!pdfCanvas) return;
+        setIsFloodFilling(true);
+        try {
+            const pageW = pdfCanvas.width;
+            const pageH = pdfCanvas.height;
+            // ROI around click for stability
+            const clickX = Math.floor(pdfPoint.x * (zoom / 100));
+            const clickY = Math.floor(pdfPoint.y * (zoom / 100));
+            const half = 640;
+            const x0 = Math.max(0, clickX - half);
+            const y0 = Math.max(0, clickY - half);
+            const x1 = Math.min(pageW, clickX + half);
+            const y1 = Math.min(pageH, clickY + half);
+            const roiW = x1 - x0;
+            const roiH = y1 - y0;
+
+            const temp = document.createElement('canvas');
+            temp.width = roiW; temp.height = roiH;
+            const tctx = temp.getContext('2d');
+            if (!tctx) return;
+            tctx.drawImage(pdfCanvas, x0, y0, roiW, roiH, 0, 0, roiW, roiH);
+            const imgData = tctx.getImageData(0, 0, roiW, roiH);
+            const data = imgData.data;
+
+            const startX = clickX - x0;
+            const startY = clickY - y0;
+            const startColor = getPixelColor(data, startX, startY, roiW);
+            if (isDarkPixel(startColor, 160)) { setIsFloodFilling(false); return; }
+
+            const isBoundary = (x: number, y: number) => {
+                const c = getPixelColor(data, x, y, roiW);
+                if (isDarkPixel(c, 160)) return true;
+                const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
+                for (const [dx, dy] of nb) {
+                    const nx = x + dx, ny = y + dy;
+                    if (nx >= 0 && nx < roiW && ny >= 0 && ny < roiH) {
+                        const cc = getPixelColor(data, nx, ny, roiW);
+                        if (isDarkPixel(cc, 160)) return true;
+                    }
+                }
+                return false;
+            };
+
+            const visited = new Set<string>();
+            const queue: Array<{ x: number, y: number }> = [{ x: startX, y: startY }];
+            const filled: Array<{ x: number, y: number }> = [];
+            const maxPixels = roiW * roiH * 0.6;
+            while (queue.length) {
+                const p = queue.shift()!; const key = `${p.x},${p.y}`;
+                if (visited.has(key) || p.x < 0 || p.x >= roiW || p.y < 0 || p.y >= roiH) continue;
+                if (isBoundary(p.x, p.y)) continue;
+                const c = getPixelColor(data, p.x, p.y, roiW);
+                if (!colorsMatch(c, startColor, 28)) continue;
+                visited.add(key); filled.push(p);
+                if (filled.length > maxPixels) break;
+                queue.push({ x: p.x + 1, y: p.y });
+                queue.push({ x: p.x - 1, y: p.y });
+                queue.push({ x: p.x, y: p.y + 1 });
+                queue.push({ x: p.x, y: p.y - 1 });
+            }
+
+            if (filled.length < 30) { setIsFloodFilling(false); return; }
+            const filledSet = new Set(filled.map(p => `${p.x},${p.y}`));
+            const boundary: Array<{ x: number, y: number }> = [];
+            for (const p of filled) {
+                const neighbors = [{ x: p.x + 1, y: p.y }, { x: p.x - 1, y: p.y }, { x: p.x, y: p.y + 1 }, { x: p.x, y: p.y - 1 }];
+                if (neighbors.some(n => !filledSet.has(`${n.x},${n.y}`))) boundary.push({ x: p.x + x0, y: p.y + y0 });
+            }
+            const boundaryPoints = traceBoundaryWithMarchingSquares(boundary);
+            if (boundaryPoints.length >= 6) {
+                // convert back to PDF coords
+                const invScale = 1 / (zoom / 100);
+                const pdfPts: number[] = [];
+                for (let i = 0; i < boundaryPoints.length; i += 2) {
+                    pdfPts.push(boundaryPoints[i] * invScale);
+                    pdfPts.push(boundaryPoints[i + 1] * invScale);
+                }
+                const newShape: Shape = {
+                    id: `shape_${Date.now()}`,
+                    type: 'filled-area',
+                    points: pdfPts,
+                    color: fillColor,
+                    strokeWidth: 0,
+                    fillColor: fillColor,
+                    filled: true
+                };
+                setShapes(prev => [...prev, newShape]);
+            }
+        } finally {
+            setIsFloodFilling(false);
+        }
+    };
 
     // Handle double click to close polygon
     const handleDoubleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -467,9 +637,9 @@ export default function SimplePdfViewer() {
                     }
                 }
 
-                // Otherwise, start dragging the clicked shape if any
+                // Otherwise, start dragging the clicked shape if any (only on left click)
                 const clickedShape = [...shapes].reverse().find(shape => isPointInShape(pdfPoint, shape));
-                if (clickedShape) {
+                if (clickedShape && e.button === 0) {
                     handleShapeSelect(clickedShape.id);
                     setDraggingShape(clickedShape.id);
                     setLastDragPdfPoint(pdfPoint);
@@ -478,7 +648,7 @@ export default function SimplePdfViewer() {
             }
         }
         // Handle drawing mode first
-        if (drawingMode && e.button === 0) {
+        if (drawEnabled && drawingMode && e.button === 0) {
             handleCanvasClick(e);
             return;
         }
@@ -504,7 +674,7 @@ export default function SimplePdfViewer() {
 
     const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
         // Handle drawing preview
-        if (drawingMode && isDrawing) {
+        if (drawEnabled && drawingMode && isDrawing) {
             const rect = containerRef.current?.getBoundingClientRect();
             if (!rect) return;
 
@@ -770,7 +940,7 @@ export default function SimplePdfViewer() {
 
         container.addEventListener('wheel', handleWheel, { passive: false });
         return () => container.removeEventListener('wheel', handleWheel);
-    }, []);
+    }, [drawEnabled]);
 
     // Draw selections on canvas
     useEffect(() => {
@@ -1321,11 +1491,11 @@ export default function SimplePdfViewer() {
                             )}
                         </div>
 
-                        {/* Draw Button (Select removed; selection is always available) */}
+                        {/* Draw Button (toggle to enable/disable drawing; when off you can pan) */}
                         <div className="flex items-center">
                             <button
-                                onClick={() => handleModeChange('draw')}
-                                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 shadow-md ${currentMode === 'draw'
+                                onClick={() => { handleModeChange('draw'); setDrawEnabled(prev => !prev); }}
+                                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 shadow-md ${drawEnabled
                                     ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700'
                                     : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
                                     }`}
@@ -1334,13 +1504,22 @@ export default function SimplePdfViewer() {
                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
                                     </svg>
-                                    <span>Draw</span>
+                                    <span>{drawEnabled ? 'Draw On' : 'Draw Off'}</span>
                                 </div>
                             </button>
+                            {selectedShapeId && (
+                                <button
+                                    onClick={deleteSelectedShape}
+                                    className="ml-2 px-3 py-2 text-xs font-medium rounded-lg bg-gradient-to-r from-red-500 to-pink-500 text-white hover:from-red-600 hover:to-pink-600 shadow-md"
+                                    title="Delete Selected Shape"
+                                >
+                                    Delete
+                                </button>
+                            )}
                         </div>
 
                         {/* Drawing Tools (only show in draw mode) */}
-                        {currentMode === 'draw' && (
+                        {currentMode === 'draw' && drawEnabled && (
                             <div className="flex items-center">
                                 <button
                                     onClick={() => setDrawingMode(drawingMode === 'line' ? null : 'line')}
@@ -1485,7 +1664,7 @@ export default function SimplePdfViewer() {
                                         ? (isCalibrating ? 'crosshair' : 'crosshair')
                                         : isSelectionMode
                                             ? (isSelecting ? 'crosshair' : 'crosshair')
-                                            : (drawingMode ? 'crosshair' : (isPanning ? 'grabbing' : 'grab'))
+                                            : (drawEnabled && drawingMode ? 'crosshair' : (isPanning ? 'grabbing' : 'grab'))
                             }}
                             onMouseDown={handleMouseDown}
                             onMouseMove={handleMouseMove}
