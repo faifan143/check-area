@@ -5,7 +5,7 @@ import dynamic from 'next/dynamic';
 
 // Dynamically import components with SSR disabled for Konva
 const Canvas = dynamic(() => import('../components/Canvas'), { ssr: false });
-const Controls = dynamic(() => import('../components/Controls'), { ssr: false });
+const Toolbar = dynamic(() => import('../components/Toolbar'), { ssr: false });
 
 interface EdgeControl {
   point: { x: number; y: number };
@@ -87,34 +87,16 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <div className="flex h-screen">
-        {/* Main Canvas Area */}
-        <div className="flex-1 flex flex-col">
-          <div className="bg-white border-b border-gray-300 p-4">
-            <h1 className="text-2xl font-bold text-gray-800">
-              Architectural Plan Editor
-            </h1>
-            <p className="text-gray-600 mt-1">
-              Upload PDF plans, draw shapes, and calculate measurements
-            </p>
-          </div>
-
-          <div className="flex-1 flex items-center justify-center p-4">
-            <Canvas
-              pdfFile={pdfFile}
-              drawingMode={drawingMode}
-              currentMode={currentMode}
-              selectedShapeId={selectedShapeId}
-              onShapesChange={handleShapesChange}
-              onShapeSelect={handleShapeSelect}
-              shapes={shapes}
-              fillColor={fillColor}
-            />
-          </div>
+      <div className="flex flex-col h-screen">
+        {/* Header */}
+        <div className="bg-white border-b border-gray-300 px-4 py-2">
+          <h1 className="text-lg font-semibold text-gray-800">
+            Architectural Plan Editor
+          </h1>
         </div>
 
-        {/* Controls Sidebar */}
-        <Controls
+        {/* Toolbar */}
+        <Toolbar
           onFileUpload={handleFileUpload}
           drawingMode={drawingMode}
           onDrawingModeChange={setDrawingMode}
@@ -128,6 +110,20 @@ export default function Home() {
           fillColor={fillColor}
           onFillColorChange={setFillColor}
         />
+
+        {/* Main Canvas Area */}
+        <div className="flex-1 flex items-center justify-center p-4">
+          <Canvas
+            pdfFile={pdfFile}
+            drawingMode={drawingMode}
+            currentMode={currentMode}
+            selectedShapeId={selectedShapeId}
+            onShapesChange={handleShapesChange}
+            onShapeSelect={handleShapeSelect}
+            shapes={shapes}
+            fillColor={fillColor}
+          />
+        </div>
       </div>
     </div>
   );

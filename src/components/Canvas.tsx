@@ -91,42 +91,16 @@ const Canvas: React.FC<CanvasProps> = ({
     }
   }, []);
 
-  // Handle PDF file upload or load demo
+  // Handle PDF file upload
   useEffect(() => {
     if (pdfFile) {
       convertPdfToSvg(pdfFile);
     } else {
-      // Load demo SVG when no PDF is uploaded
-      loadDemoSVG();
+      // Clear any existing image when no PDF is uploaded
+      setSvgImage(null);
+      setConversionError(null);
     }
   }, [pdfFile, convertPdfToSvg]);
-
-  // Load demo SVG for testing
-  const loadDemoSVG = useCallback(async () => {
-    setIsLoading(true);
-    try {
-      const { PDFConverter } = await import('../utils/pdfConverter');
-      const result = PDFConverter.createDemoSVG();
-
-      const blob = new Blob([result.svgString], { type: 'image/svg+xml' });
-      const url = URL.createObjectURL(blob);
-
-      const img = new window.Image();
-      img.onload = () => {
-        setSvgImage(img);
-        setIsLoading(false);
-      };
-      img.onerror = () => {
-        setConversionError('Failed to load demo image');
-        setIsLoading(false);
-      };
-      img.src = url;
-    } catch (error) {
-      console.error('Error loading demo SVG:', error);
-      setConversionError('Failed to load demo plan');
-      setIsLoading(false);
-    }
-  }, []);
 
   // Flood fill algorithm to detect boundaries and create filled areas
   const performFloodFill = useCallback(async (clickPoint: { x: number; y: number }) => {
@@ -1310,6 +1284,46 @@ const Canvas: React.FC<CanvasProps> = ({
             >
               Try Again
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Professional placeholder when no PDF is uploaded */}
+      {!pdfFile && !svgImage && !isLoading && !conversionError && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-50 z-10">
+          <div className="text-center max-w-md mx-4">
+            <div className="mb-6">
+              <svg className="mx-auto h-16 w-16 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+            </div>
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">
+              Upload Your Architectural Plan
+            </h3>
+            <p className="text-gray-600 mb-6">
+              Get started by uploading a PDF file of your architectural plan.
+              You can then draw shapes, measure areas, and analyze your design.
+            </p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-center space-x-2 text-sm text-gray-500">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                <span>Drag and drop your PDF file</span>
+              </div>
+              <div className="flex items-center justify-center space-x-2 text-sm text-gray-500">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                <span>Or use the upload button in the toolbar</span>
+              </div>
+              <div className="flex items-center justify-center space-x-2 text-sm text-gray-500">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                <span>Maximum file size: 10MB</span>
+              </div>
+            </div>
           </div>
         </div>
       )}

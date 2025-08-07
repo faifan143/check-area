@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/esm/Page/AnnotationLayer.css";
 import "react-pdf/dist/esm/Page/TextLayer.css";
@@ -22,6 +22,25 @@ interface Calibration {
     pixelsPerMeter: number;
     referenceLength: number; // pixels
     referenceMeters: number; // actual meters
+}
+
+interface EdgeControl {
+    point: { x: number; y: number };
+    edgeIndex: number; // Which edge this controls (from point index to next point)
+}
+
+interface Shape {
+    id: string;
+    type: 'circle' | 'rectangle' | 'polygon' | 'line' | 'filled-area';
+    points: number[];
+    color: string;
+    strokeWidth: number;
+    selected?: boolean; // For selection state
+    curveMode?: boolean; // Enable curve mode for polygons
+    edgeControls?: EdgeControl[]; // Curve control points for polygons
+    bezierPoints?: number[][];
+    fillColor?: string; // Fill color for filled areas
+    filled?: boolean; // Whether the shape is filled
 }
 
 export default function SimplePdfViewer() {
@@ -47,6 +66,24 @@ export default function SimplePdfViewer() {
     const [calibrationEnd, setCalibrationEnd] = useState({ x: 0, y: 0 });
     const [calibration, setCalibration] = useState<Calibration | null>(null);
     const [calibrationMeters, setCalibrationMeters] = useState(1);
+
+    // Drawing state
+    const [drawingMode, setDrawingMode] = useState<'circle' | 'rectangle' | 'polygon' | 'line' | 'fill' | null>(null);
+    // Single mode: draw + select combined. We keep state for backward compatibility.
+    const [currentMode, setCurrentMode] = useState<'draw' | 'select'>('draw');
+    const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
+    const [shapes, setShapes] = useState<Shape[]>([]);
+    const [fillColor, setFillColor] = useState<string>('#ffeb3b'); // Default fill color (yellow)
+    const [drawingPoints, setDrawingPoints] = useState<number[]>([]);
+    const [isDrawing, setIsDrawing] = useState(false);
+    const [mousePosition, setMousePosition] = useState<{ x: number; y: number } | null>(null);
+    const [draggingShape, setDraggingShape] = useState<string | null>(null);
+    const [dragOffset, setDragOffset] = useState<{ x: number; y: number } | null>(null);
+    const [resizing, setResizing] = useState<{ shapeId: string; handleIndex: number } | null>(null);
+    const [draggedControlPoint, setDraggedControlPoint] = useState<{ shapeId: string; pointIndex: number; type: 'vertex' | 'edge' } | null>(null);
+    const [isFloodFilling, setIsFloodFilling] = useState(false);
+    const [lastDragPdfPoint, setLastDragPdfPoint] = useState<{ x: number; y: number } | null>(null);
+    const [hoverCursor, setHoverCursor] = useState<string | null>(null);
 
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -97,6 +134,249 @@ export default function SimplePdfViewer() {
         setSelections([]);
     };
 
+    // Drawing functions
+    const handleModeChange = (mode: 'draw' | 'select') => {
+        setCurrentMode(mode);
+        // With unified mode, keep behavior minimal
+        if (mode !== 'draw') setDrawingMode(null);
+    };
+
+    const handleShapeSelect = (shapeId: string | null) => {
+        setSelectedShapeId(shapeId);
+        setShapes(shapes.map(shape => ({
+            ...shape,
+            selected: shape.id === shapeId
+        })));
+    };
+
+    // Curve mode is always enabled for polygons now; no toggle needed
+
+    // Hit testing function to check if point is inside a shape
+    const isPointInShape = useCallback((point: { x: number; y: number }, shape: Shape): boolean => {
+        if (shape.type === 'circle') {
+            const [centerX, centerY, radius] = shape.points;
+            const distance = Math.sqrt(
+                Math.pow(point.x - centerX, 2) + Math.pow(point.y - centerY, 2)
+            );
+            return distance <= radius;
+        } else if (shape.type === 'rectangle') {
+            const [x, y, width, height] = shape.points;
+            const minX = Math.min(x, x + width);
+            const maxX = Math.max(x, x + width);
+            const minY = Math.min(y, y + height);
+            const maxY = Math.max(y, y + height);
+            return point.x >= minX && point.x <= maxX && point.y >= minY && point.y <= maxY;
+        } else if (shape.type === 'line') {
+            // For lines, check if point is close to the line (within 5 pixels)
+            const [x1, y1, x2, y2] = shape.points;
+            const A = point.x - x1;
+            const B = point.y - y1;
+            const C = x2 - x1;
+            const D = y2 - y1;
+
+            const dot = A * C + B * D;
+            const lenSq = C * C + D * D;
+            const param = lenSq !== 0 ? dot / lenSq : -1;
+
+            let xx, yy;
+            if (param < 0) {
+                xx = x1;
+                yy = y1;
+            } else if (param > 1) {
+                xx = x2;
+                yy = y2;
+            } else {
+                xx = x1 + param * C;
+                yy = y1 + param * D;
+            }
+
+            const dx = point.x - xx;
+            const dy = point.y - yy;
+            return Math.sqrt(dx * dx + dy * dy) <= 5;
+        } else if (shape.type === 'polygon') {
+            // Point-in-polygon test using ray casting
+            let inside = false;
+            const points = [];
+            for (let i = 0; i < shape.points.length; i += 2) {
+                points.push({ x: shape.points[i], y: shape.points[i + 1] });
+            }
+
+            for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+                if (((points[i].y > point.y) !== (points[j].y > point.y)) &&
+                    (point.x < (points[j].x - points[i].x) * (point.y - points[i].y) / (points[j].y - points[i].y) + points[i].x)) {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        }
+        return false;
+    }, []);
+
+    // Handle canvas click for drawing or selection
+    const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+
+        const point = {
+            x: e.clientX - rect.left - pan.x,
+            y: e.clientY - rect.top - pan.y
+        };
+
+        // Convert to PDF coordinates
+        const pdfPoint = {
+            x: point.x / (zoom / 100),
+            y: point.y / (zoom / 100)
+        };
+
+        // Handle selection mode
+        if (currentMode === 'select') {
+            // Find clicked shape (check from top to bottom)
+            const clickedShape = [...shapes].reverse().find(shape => isPointInShape(pdfPoint, shape));
+
+            if (clickedShape) {
+                handleShapeSelect(clickedShape.id);
+            } else {
+                handleShapeSelect(null);
+            }
+            return;
+        }
+
+        // Handle drawing mode
+        if (!drawingMode || draggingShape || isFloodFilling) return;
+
+        // Handle flood fill mode
+        if (drawingMode === 'fill') {
+            // For now, just create a simple filled area
+            const newShape: Shape = {
+                id: `shape_${Date.now()}`,
+                type: 'filled-area',
+                points: [pdfPoint.x - 20, pdfPoint.y - 20, pdfPoint.x + 20, pdfPoint.y - 20, pdfPoint.x + 20, pdfPoint.y + 20, pdfPoint.x - 20, pdfPoint.y + 20],
+                color: fillColor,
+                strokeWidth: 0,
+                fillColor: fillColor,
+                filled: true
+            };
+            setShapes([...shapes, newShape]);
+            return;
+        }
+
+        if (drawingMode === 'line') {
+            if (drawingPoints.length === 0) {
+                setDrawingPoints([pdfPoint.x, pdfPoint.y]);
+                setIsDrawing(true);
+            } else {
+                const newShape: Shape = {
+                    id: `shape_${Date.now()}`,
+                    type: 'line',
+                    points: [...drawingPoints, pdfPoint.x, pdfPoint.y],
+                    color: '#3b82f6', // Blue
+                    strokeWidth: 2
+                };
+                setShapes([...shapes, newShape]);
+                setDrawingPoints([]);
+                setIsDrawing(false);
+                setMousePosition(null);
+            }
+        } else if (drawingMode === 'circle') {
+            if (drawingPoints.length === 0) {
+                setDrawingPoints([pdfPoint.x, pdfPoint.y]);
+                setIsDrawing(true);
+            } else {
+                const [x1, y1] = drawingPoints;
+                const [x2, y2] = [pdfPoint.x, pdfPoint.y];
+                const centerX = (x1 + x2) / 2;
+                const centerY = (y1 + y2) / 2;
+                const radius = Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2)) / 2;
+
+                const newShape: Shape = {
+                    id: `shape_${Date.now()}`,
+                    type: 'circle',
+                    points: [centerX, centerY, radius],
+                    color: '#ef4444', // Red
+                    strokeWidth: 2
+                };
+                setShapes([...shapes, newShape]);
+                setDrawingPoints([]);
+                setIsDrawing(false);
+                setMousePosition(null);
+            }
+        } else if (drawingMode === 'rectangle') {
+            if (drawingPoints.length === 0) {
+                setDrawingPoints([pdfPoint.x, pdfPoint.y]);
+                setIsDrawing(true);
+            } else {
+                const [x1, y1] = drawingPoints;
+                const [x2, y2] = [pdfPoint.x, pdfPoint.y];
+
+                const newShape: Shape = {
+                    id: `shape_${Date.now()}`,
+                    type: 'rectangle',
+                    points: [x1, y1, x2 - x1, y2 - y1],
+                    color: '#3b82f6', // Blue
+                    strokeWidth: 2
+                };
+                setShapes([...shapes, newShape]);
+                setDrawingPoints([]);
+                setIsDrawing(false);
+                setMousePosition(null);
+            }
+        } else if (drawingMode === 'polygon') {
+            // Add point to polygon
+            setDrawingPoints([...drawingPoints, pdfPoint.x, pdfPoint.y]);
+            setIsDrawing(true);
+        }
+    }, [drawingMode, drawingPoints, shapes, draggingShape, currentMode, isPointInShape, isFloodFilling, fillColor, pan, zoom]);
+
+    // Handle double click to close polygon
+    const handleDoubleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+        if (drawingMode === 'polygon' && drawingPoints.length >= 6) { // At least 3 points (6 coordinates)
+            // Clean up duplicate last point(s) caused by double-click second click
+            const cleaned = [...drawingPoints];
+            const eps = 0.5; // in PDF coords
+
+            const dist = (ax: number, ay: number, bx: number, by: number) => Math.hypot(ax - bx, ay - by);
+
+            // Remove trailing duplicates (last point nearly equal to previous)
+            while (cleaned.length >= 4) {
+                const lx = cleaned[cleaned.length - 2];
+                const ly = cleaned[cleaned.length - 1];
+                const px = cleaned[cleaned.length - 4];
+                const py = cleaned[cleaned.length - 3];
+                if (dist(lx, ly, px, py) <= eps) {
+                    cleaned.splice(cleaned.length - 2, 2);
+                } else {
+                    break;
+                }
+            }
+
+            // If last point equals first point, drop the last
+            if (cleaned.length >= 6) {
+                const lx = cleaned[cleaned.length - 2];
+                const ly = cleaned[cleaned.length - 1];
+                const fx = cleaned[0];
+                const fy = cleaned[1];
+                if (dist(lx, ly, fx, fy) <= eps) {
+                    cleaned.splice(cleaned.length - 2, 2);
+                }
+            }
+
+            if (cleaned.length >= 6) {
+                const newShape: Shape = {
+                    id: `shape_${Date.now()}`,
+                    type: 'polygon',
+                    points: cleaned,
+                    color: '#ef4444', // Red
+                    strokeWidth: 2,
+                    curveMode: true
+                };
+                setShapes([...shapes, newShape]);
+            }
+            setDrawingPoints([]);
+            setIsDrawing(false);
+            setMousePosition(null);
+        }
+    }, [drawingMode, drawingPoints, shapes]);
+
     // Helper function to convert mouse coordinates to PDF coordinates
     const getPdfCoordinates = (e: React.MouseEvent<HTMLDivElement>) => {
         const rect = containerRef.current?.getBoundingClientRect();
@@ -118,6 +398,91 @@ export default function SimplePdfViewer() {
     };
 
     const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+        // Selection interactions (move/resize/curve) like home page
+        {
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (rect) {
+                const pdfPoint = {
+                    x: (e.clientX - rect.left - pan.x) / (zoom / 100),
+                    y: (e.clientY - rect.top - pan.y) / (zoom / 100)
+                };
+
+                // Prefer working on the selected shape if any
+                const selectedShape = selectedShapeId ? shapes.find(s => s.id === selectedShapeId) : undefined;
+
+                // Utility thresholds in pdf coords
+                const threshold = 8 / (zoom / 100);
+
+                // If selected polygon, check handles first
+                if (selectedShape && selectedShape.type === 'polygon') {
+                    // Check vertices proximity
+                    for (let i = 0; i < selectedShape.points.length; i += 2) {
+                        const vx = selectedShape.points[i];
+                        const vy = selectedShape.points[i + 1];
+                        if (Math.hypot(pdfPoint.x - vx, pdfPoint.y - vy) <= threshold) {
+                            setDraggedControlPoint({ shapeId: selectedShape.id, pointIndex: i, type: 'vertex' });
+                            return;
+                        }
+                    }
+
+                    // Check edge control points (existing or midpoints)
+                    for (let i = 0; i < selectedShape.points.length; i += 2) {
+                        const nextIndex = (i + 2) % selectedShape.points.length;
+                        const midX = (selectedShape.points[i] + selectedShape.points[nextIndex]) / 2;
+                        const midY = (selectedShape.points[i + 1] + selectedShape.points[nextIndex + 1]) / 2;
+
+                        const existing = selectedShape.edgeControls?.find(ec => ec.edgeIndex === i / 2);
+                        const control = existing ? existing.point : { x: midX, y: midY };
+                        if (Math.hypot(pdfPoint.x - control.x, pdfPoint.y - control.y) <= threshold) {
+                            setDraggedControlPoint({ shapeId: selectedShape.id, pointIndex: i, type: 'edge' });
+                            return;
+                        }
+                    }
+                }
+
+                // If selected rectangle, check resize handles
+                if (selectedShape && selectedShape.type === 'rectangle') {
+                    const [rx, ry, rwidth, rheight] = selectedShape.points;
+                    const minX = Math.min(rx, rx + rwidth);
+                    const maxX = Math.max(rx, rx + rwidth);
+                    const minY = Math.min(ry, ry + rheight);
+                    const maxY = Math.max(ry, ry + rheight);
+
+                    const handles = [
+                        { x: minX, y: minY }, // 0 nw
+                        { x: maxX, y: minY }, // 1 ne
+                        { x: maxX, y: maxY }, // 2 se
+                        { x: minX, y: maxY }, // 3 sw
+                        { x: (minX + maxX) / 2, y: minY }, // 4 n
+                        { x: (minX + maxX) / 2, y: maxY }, // 5 s
+                        { x: minX, y: (minY + maxY) / 2 }, // 6 w
+                        { x: maxX, y: (minY + maxY) / 2 }  // 7 e
+                    ];
+
+                    for (let i = 0; i < handles.length; i++) {
+                        if (Math.hypot(pdfPoint.x - handles[i].x, pdfPoint.y - handles[i].y) <= threshold) {
+                            setResizing({ shapeId: selectedShape.id, handleIndex: i });
+                            return;
+                        }
+                    }
+                }
+
+                // Otherwise, start dragging the clicked shape if any
+                const clickedShape = [...shapes].reverse().find(shape => isPointInShape(pdfPoint, shape));
+                if (clickedShape) {
+                    handleShapeSelect(clickedShape.id);
+                    setDraggingShape(clickedShape.id);
+                    setLastDragPdfPoint(pdfPoint);
+                    return;
+                }
+            }
+        }
+        // Handle drawing mode first
+        if (drawingMode && e.button === 0) {
+            handleCanvasClick(e);
+            return;
+        }
+
         if (isCalibrationMode) {
             // Start calibration
             const coords = getPdfCoordinates(e);
@@ -138,6 +503,161 @@ export default function SimplePdfViewer() {
     };
 
     const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+        // Handle drawing preview
+        if (drawingMode && isDrawing) {
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (!rect) return;
+
+            const point = {
+                x: e.clientX - rect.left - pan.x,
+                y: e.clientY - rect.top - pan.y
+            };
+
+            const pdfPoint = {
+                x: point.x / (zoom / 100),
+                y: point.y / (zoom / 100)
+            };
+
+            setMousePosition(pdfPoint);
+            return;
+        }
+
+        // Dragging shape in select mode
+        if (draggingShape) {
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (!rect) return;
+            const pdfPoint = {
+                x: (e.clientX - rect.left - pan.x) / (zoom / 100),
+                y: (e.clientY - rect.top - pan.y) / (zoom / 100)
+            };
+            if (!lastDragPdfPoint) {
+                setLastDragPdfPoint(pdfPoint);
+                return;
+            }
+            const dx = pdfPoint.x - lastDragPdfPoint.x;
+            const dy = pdfPoint.y - lastDragPdfPoint.y;
+            if (dx !== 0 || dy !== 0) {
+                setShapes(prev => prev.map(s => {
+                    if (s.id !== draggingShape) return s;
+                    let newPoints: number[] = [];
+                    if (s.type === 'line' || s.type === 'polygon' || s.type === 'rectangle' || s.type === 'filled-area') {
+                        for (let i = 0; i < s.points.length; i += 2) {
+                            newPoints.push(s.points[i] + dx);
+                            newPoints.push(s.points[i + 1] + dy);
+                        }
+                    } else if (s.type === 'circle') {
+                        newPoints = [s.points[0] + dx, s.points[1] + dy, s.points[2]];
+                    }
+                    let newEdgeControls = s.edgeControls ? s.edgeControls.map(ec => ({ edgeIndex: ec.edgeIndex, point: { x: ec.point.x + dx, y: ec.point.y + dy } })) : undefined;
+                    return { ...s, points: newPoints, edgeControls: newEdgeControls };
+                }));
+                setLastDragPdfPoint(pdfPoint);
+            }
+            return;
+        }
+
+        // Dragging polygon control point
+        if (draggedControlPoint) {
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (!rect) return;
+            const pdfPoint = {
+                x: (e.clientX - rect.left - pan.x) / (zoom / 100),
+                y: (e.clientY - rect.top - pan.y) / (zoom / 100)
+            };
+            setShapes(prev => prev.map(s => {
+                if (s.id !== draggedControlPoint.shapeId || s.type !== 'polygon') return s;
+                if (draggedControlPoint.type === 'vertex') {
+                    const newPts = [...s.points];
+                    newPts[draggedControlPoint.pointIndex] = pdfPoint.x;
+                    newPts[draggedControlPoint.pointIndex + 1] = pdfPoint.y;
+                    return { ...s, points: newPts };
+                } else {
+                    const edgeIndex = draggedControlPoint.pointIndex / 2;
+                    const newControls = [...(s.edgeControls || [])];
+                    const idx = newControls.findIndex(ec => ec.edgeIndex === edgeIndex);
+                    if (idx >= 0) {
+                        newControls[idx] = { edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } };
+                    } else {
+                        newControls.push({ edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } });
+                    }
+                    return { ...s, edgeControls: newControls };
+                }
+            }));
+            return;
+        }
+
+        // Hover cursor feedback when not dragging
+        {
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (rect) {
+                const pdfPoint = {
+                    x: (e.clientX - rect.left - pan.x) / (zoom / 100),
+                    y: (e.clientY - rect.top - pan.y) / (zoom / 100)
+                };
+                const threshold = 8 / (zoom / 100);
+                let cursor: string | null = null;
+                const selectedShape = selectedShapeId ? shapes.find(s => s.id === selectedShapeId) : undefined;
+
+                // Check polygon handles
+                if (selectedShape && selectedShape.type === 'polygon') {
+                    for (let i = 0; i < selectedShape.points.length; i += 2) {
+                        const vx = selectedShape.points[i];
+                        const vy = selectedShape.points[i + 1];
+                        if (Math.hypot(pdfPoint.x - vx, pdfPoint.y - vy) <= threshold) {
+                            cursor = 'grab';
+                            break;
+                        }
+                    }
+                    if (!cursor) {
+                        for (let i = 0; i < selectedShape.points.length; i += 2) {
+                            const nextIndex = (i + 2) % selectedShape.points.length;
+                            const midX = (selectedShape.points[i] + selectedShape.points[nextIndex]) / 2;
+                            const midY = (selectedShape.points[i + 1] + selectedShape.points[nextIndex + 1]) / 2;
+                            const existing = selectedShape.edgeControls?.find(ec => ec.edgeIndex === i / 2);
+                            const cp = existing ? existing.point : { x: midX, y: midY };
+                            if (Math.hypot(pdfPoint.x - cp.x, pdfPoint.y - cp.y) <= threshold) {
+                                cursor = 'grab';
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Check rectangle resize handles
+                if (!cursor && selectedShape && selectedShape.type === 'rectangle') {
+                    const [rx, ry, rwidth, rheight] = selectedShape.points;
+                    const minX = Math.min(rx, rx + rwidth);
+                    const maxX = Math.max(rx, rx + rwidth);
+                    const minY = Math.min(ry, ry + rheight);
+                    const maxY = Math.max(ry, ry + rheight);
+                    const handles = [
+                        { x: minX, y: minY },
+                        { x: maxX, y: minY },
+                        { x: maxX, y: maxY },
+                        { x: minX, y: maxY },
+                        { x: (minX + maxX) / 2, y: minY },
+                        { x: (minX + maxX) / 2, y: maxY },
+                        { x: minX, y: (minY + maxY) / 2 },
+                        { x: maxX, y: (minY + maxY) / 2 }
+                    ];
+                    for (let i = 0; i < handles.length; i++) {
+                        if (Math.hypot(pdfPoint.x - handles[i].x, pdfPoint.y - handles[i].y) <= threshold) {
+                            cursor = i <= 3 ? 'nwse-resize' : 'ew-resize';
+                            break;
+                        }
+                    }
+                }
+
+                // Over any shape
+                if (!cursor) {
+                    const overShape = [...shapes].reverse().find(s => isPointInShape(pdfPoint, s));
+                    if (overShape) cursor = 'pointer';
+                }
+
+                setHoverCursor(cursor);
+            }
+        }
+
         if (isCalibrating) {
             // Update calibration
             const coords = getPdfCoordinates(e);
@@ -161,6 +681,16 @@ export default function SimplePdfViewer() {
     };
 
     const handleMouseUp = () => {
+        if (draggingShape) {
+            setDraggingShape(null);
+            setLastDragPdfPoint(null);
+        }
+        if (draggedControlPoint) {
+            setDraggedControlPoint(null);
+        }
+        if (resizing) {
+            setResizing(null);
+        }
         if (isCalibrating) {
             // Finish calibration
             const length = Math.sqrt(
@@ -350,8 +880,300 @@ export default function SimplePdfViewer() {
             ctx.fillText(`${calibration.referenceMeters}m`, midX + 10, midY - 10);
         }
 
+        // Draw shapes
+        shapes.forEach((shape) => {
+            ctx.save();
+
+            // Convert PDF coordinates to canvas coordinates
+            const scale = zoom / 100;
+
+            switch (shape.type) {
+                case 'circle':
+                    const [centerX, centerY, radius] = shape.points;
+                    const scaledCenterX = centerX * scale;
+                    const scaledCenterY = centerY * scale;
+                    const scaledRadius = radius * scale;
+
+                    ctx.strokeStyle = shape.selected ? '#ff0000' : shape.color;
+                    ctx.lineWidth = shape.selected ? 3 : shape.strokeWidth;
+                    ctx.beginPath();
+                    ctx.arc(scaledCenterX, scaledCenterY, scaledRadius, 0, 2 * Math.PI);
+                    ctx.stroke();
+
+                    // Fill with semi-transparent color
+                    ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
+                    ctx.fill();
+                    break;
+
+                case 'rectangle':
+                    const [x, y, width, height] = shape.points;
+                    const scaledX = x * scale;
+                    const scaledY = y * scale;
+                    const scaledWidth = width * scale;
+                    const scaledHeight = height * scale;
+
+                    ctx.strokeStyle = shape.selected ? '#ff0000' : shape.color;
+                    ctx.lineWidth = shape.selected ? 3 : shape.strokeWidth;
+                    ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
+
+                    // Fill with semi-transparent color
+                    ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
+                    ctx.fillRect(scaledX, scaledY, scaledWidth, scaledHeight);
+                    break;
+
+                case 'line':
+                    const [x1, y1, x2, y2] = shape.points;
+                    const scaledX1 = x1 * scale;
+                    const scaledY1 = y1 * scale;
+                    const scaledX2 = x2 * scale;
+                    const scaledY2 = y2 * scale;
+
+                    ctx.strokeStyle = shape.color;
+                    ctx.lineWidth = shape.strokeWidth;
+                    ctx.beginPath();
+                    ctx.moveTo(scaledX1, scaledY1);
+                    ctx.lineTo(scaledX2, scaledY2);
+                    ctx.stroke();
+                    break;
+
+                case 'polygon':
+                    ctx.strokeStyle = shape.selected ? '#ff0000' : shape.color;
+                    ctx.lineWidth = shape.selected ? 3 : shape.strokeWidth;
+                    ctx.beginPath();
+
+                    if (shape.curveMode && shape.edgeControls && shape.edgeControls.length > 0) {
+                        for (let i = 0; i < shape.points.length; i += 2) {
+                            const x = shape.points[i] * scale;
+                            const y = shape.points[i + 1] * scale;
+                            if (i === 0) {
+                                ctx.moveTo(x, y);
+                            } else {
+                                const edgeIndex = (i / 2) - 1;
+                                const ec = shape.edgeControls.find(ec => ec.edgeIndex === edgeIndex);
+                                if (ec) {
+                                    ctx.quadraticCurveTo(ec.point.x * scale, ec.point.y * scale, x, y);
+                                } else {
+                                    ctx.lineTo(x, y);
+                                }
+                            }
+                        }
+                        // Closing edge
+                        const lastEdgeIndex = (shape.points.length / 2) - 1;
+                        const lastEC = shape.edgeControls.find(ec => ec.edgeIndex === lastEdgeIndex);
+                        if (lastEC) {
+                            ctx.quadraticCurveTo(lastEC.point.x * scale, lastEC.point.y * scale, shape.points[0] * scale, shape.points[1] * scale);
+                        } else {
+                            ctx.closePath();
+                        }
+                    } else {
+                        for (let i = 0; i < shape.points.length; i += 2) {
+                            const x = shape.points[i] * scale;
+                            const y = shape.points[i + 1] * scale;
+                            if (i === 0) {
+                                ctx.moveTo(x, y);
+                            } else {
+                                ctx.lineTo(x, y);
+                            }
+                        }
+                        ctx.closePath();
+                    }
+
+                    ctx.stroke();
+
+                    // Fill with semi-transparent color
+                    ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
+                    ctx.fill();
+
+                    // Draw control handles when selected (draggable)
+                    if (shape.selected) {
+                        // Vertex handles
+                        for (let i = 0; i < shape.points.length; i += 2) {
+                            const vx = shape.points[i] * scale;
+                            const vy = shape.points[i + 1] * scale;
+                            ctx.fillStyle = '#ffffff';
+                            ctx.strokeStyle = '#000000';
+                            ctx.lineWidth = 2;
+                            ctx.beginPath();
+                            ctx.arc(vx, vy, 6, 0, 2 * Math.PI);
+                            ctx.fill();
+                            ctx.stroke();
+                        }
+                        // Edge controls for curve mode
+                        if (shape.curveMode) {
+                            for (let i = 0; i < shape.points.length; i += 2) {
+                                const nextIndex = (i + 2) % shape.points.length;
+                                const midX = (shape.points[i] + shape.points[nextIndex]) / 2;
+                                const midY = (shape.points[i + 1] + shape.points[nextIndex + 1]) / 2;
+                                const ec = shape.edgeControls?.find(ec => ec.edgeIndex === i / 2);
+                                const cp = ec ? ec.point : { x: midX, y: midY };
+                                if (ec) {
+                                    // guide line
+                                    ctx.strokeStyle = '#999999';
+                                    ctx.lineWidth = 1;
+                                    ctx.setLineDash([3, 3]);
+                                    ctx.beginPath();
+                                    ctx.moveTo(midX * scale, midY * scale);
+                                    ctx.lineTo(cp.x * scale, cp.y * scale);
+                                    ctx.stroke();
+                                    ctx.setLineDash([]);
+                                }
+                                // control point
+                                ctx.fillStyle = ec ? '#4ecdc4' : '#dddddd';
+                                ctx.strokeStyle = '#666666';
+                                ctx.lineWidth = 1;
+                                ctx.beginPath();
+                                ctx.arc(cp.x * scale, cp.y * scale, 5, 0, 2 * Math.PI);
+                                ctx.fill();
+                                ctx.stroke();
+                            }
+                        }
+                    }
+                    break;
+
+                case 'filled-area':
+                    ctx.fillStyle = shape.fillColor || fillColor;
+                    ctx.strokeStyle = shape.selected ? '#ff0000' : 'rgba(0,0,0,0.1)';
+                    ctx.lineWidth = shape.selected ? 2 : 0;
+                    ctx.globalAlpha = 0.85;
+
+                    ctx.beginPath();
+                    for (let i = 0; i < shape.points.length; i += 2) {
+                        const x = shape.points[i] * scale;
+                        const y = shape.points[i + 1] * scale;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.closePath();
+                    ctx.fill();
+                    if (shape.selected) {
+                        ctx.stroke();
+                    }
+                    ctx.globalAlpha = 1;
+                    break;
+            }
+
+            ctx.restore();
+        });
+
+        // Draw drawing preview
+        if (isDrawing && drawingPoints.length > 0 && mousePosition) {
+            ctx.save();
+            const scale = zoom / 100;
+
+            if (drawingMode === 'line') {
+                ctx.strokeStyle = '#0066cc';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(drawingPoints[0] * scale, drawingPoints[1] * scale);
+                ctx.lineTo(mousePosition.x * scale, mousePosition.y * scale);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            } else if (drawingMode === 'circle') {
+                const centerX = (drawingPoints[0] + mousePosition.x) / 2 * scale;
+                const centerY = (drawingPoints[1] + mousePosition.y) / 2 * scale;
+                const radius = Math.sqrt(Math.pow(mousePosition.x - drawingPoints[0], 2) + Math.pow(mousePosition.y - drawingPoints[1], 2)) / 2 * scale;
+
+                ctx.strokeStyle = '#ef4444';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                ctx.fillStyle = 'rgba(239, 68, 68, 0.2)';
+                ctx.fill();
+            } else if (drawingMode === 'rectangle') {
+                const x = drawingPoints[0] * scale;
+                const y = drawingPoints[1] * scale;
+                const width = (mousePosition.x - drawingPoints[0]) * scale;
+                const height = (mousePosition.y - drawingPoints[1]) * scale;
+
+                ctx.strokeStyle = '#3b82f6';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.strokeRect(x, y, width, height);
+                ctx.setLineDash([]);
+
+                ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+                ctx.fillRect(x, y, width, height);
+            } else if (drawingMode === 'polygon') {
+                ctx.strokeStyle = '#ef4444';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+
+                // Draw existing lines
+                if (drawingPoints.length >= 4) {
+                    ctx.beginPath();
+                    for (let i = 0; i < drawingPoints.length; i += 2) {
+                        const x = drawingPoints[i] * scale;
+                        const y = drawingPoints[i + 1] * scale;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.stroke();
+                }
+
+                // Draw line from last point to current mouse position
+                if (drawingPoints.length >= 2) {
+                    ctx.beginPath();
+                    ctx.moveTo(drawingPoints[drawingPoints.length - 2] * scale, drawingPoints[drawingPoints.length - 1] * scale);
+                    ctx.lineTo(mousePosition.x * scale, mousePosition.y * scale);
+                    ctx.stroke();
+                }
+
+                // Draw line from current mouse position back to first point
+                if (drawingPoints.length >= 2) {
+                    ctx.setLineDash([3, 3]);
+                    ctx.globalAlpha = 0.5;
+                    ctx.beginPath();
+                    ctx.moveTo(mousePosition.x * scale, mousePosition.y * scale);
+                    ctx.lineTo(drawingPoints[0] * scale, drawingPoints[1] * scale);
+                    ctx.stroke();
+                    ctx.globalAlpha = 1;
+                }
+
+                ctx.setLineDash([]);
+
+                // Draw points
+                drawingPoints.forEach((point, index) => {
+                    if (index % 2 === 0) {
+                        ctx.fillStyle = '#ef4444';
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.arc(point * scale, drawingPoints[index + 1] * scale, 3, 0, 2 * Math.PI);
+                        ctx.fill();
+                        ctx.stroke();
+                    }
+                });
+
+                // Draw current mouse position
+                ctx.fillStyle = '#ef4444';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1;
+                ctx.globalAlpha = 0.7;
+                ctx.beginPath();
+                ctx.arc(mousePosition.x * scale, mousePosition.y * scale, 3, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+            }
+
+            ctx.restore();
+        }
+
         ctx.restore();
-    }, [selections, isSelecting, selectionStart, selectionEnd, isCalibrating, calibrationStart, calibrationEnd, calibration, calibrationMeters, zoom, pan]);
+    }, [selections, isSelecting, selectionStart, selectionEnd, isCalibrating, calibrationStart, calibrationEnd, calibration, calibrationMeters, zoom, pan, shapes, isDrawing, drawingPoints, mousePosition, drawingMode, fillColor]);
 
     const handlePageLoadSuccess = (page: any) => {
         setPageWidth(page.width);
@@ -364,29 +1186,22 @@ export default function SimplePdfViewer() {
 
     return (
         <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
-            {/* Enhanced Header */}
+            {/* Enlarged Header */}
             <header className="border-b border-slate-200/60 bg-white/90 backdrop-blur-xl sticky top-0 z-50 shadow-sm">
-                <div className="container mx-auto px-6 py-4">
+                <div className="container mx-auto px-6 py-3">
                     <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-6">
-                            <div className="flex items-center space-x-3">
-                                <div className="w-10 h-10 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg">
-                                    <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                                    </svg>
-                                </div>
-                                <div>
-                                    <h1 className="text-2xl font-bold bg-gradient-to-r from-slate-900 to-slate-700 bg-clip-text text-transparent">
-                                        PDF Area Calculator
-                                    </h1>
-                                    <p className="text-sm text-slate-500 font-medium">Professional Measurement Tool</p>
-                                </div>
+                        <div className="flex items-center space-x-3">
+                            <div className="w-8 h-8 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-lg flex items-center justify-center">
+                                <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                </svg>
                             </div>
+                            <h1 className="text-lg font-bold text-slate-800">PDF Area Calculator</h1>
                         </div>
 
-                        {/* Enhanced File Upload */}
-                        <div className="flex items-center space-x-4">
-                            <div className="relative group">
+                        {/* Enlarged File Upload */}
+                        <div className="flex items-center">
+                            <div className="relative">
                                 <input
                                     type="file"
                                     accept="application/pdf"
@@ -396,15 +1211,12 @@ export default function SimplePdfViewer() {
                                 />
                                 <label
                                     htmlFor="file-upload"
-                                    className="flex items-center space-x-3 px-6 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-xl hover:from-blue-700 hover:to-indigo-700 transition-all duration-200 cursor-pointer shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
+                                    className="flex items-center space-x-2 px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-lg hover:from-blue-700 hover:to-indigo-700 transition-all duration-200 cursor-pointer text-sm font-medium shadow-sm"
                                 >
-                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                                     </svg>
-                                    <span className="font-semibold">Upload PDF</span>
-                                    <svg className="w-4 h-4 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                                    </svg>
+                                    <span>Upload PDF</span>
                                 </label>
                             </div>
                         </div>
@@ -412,204 +1224,211 @@ export default function SimplePdfViewer() {
                 </div>
             </header>
 
-            <div className="container mx-auto px-6 py-8">
-                {/* Enhanced Controls Panel */}
-                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 p-8 mb-8">
-                    <div className="grid grid-cols-1 xl:grid-cols-4 gap-8">
-                        {/* Enhanced Zoom Controls */}
-                        <div className="space-y-4">
-                            <div className="flex items-center space-x-3 mb-4">
-                                <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-blue-600 rounded-lg flex items-center justify-center">
-                                    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0zM10 7v3m0 0v3m0-3h3m-3 0H7" />
-                                    </svg>
-                                </div>
-                                <h3 className="text-lg font-bold text-slate-800">Zoom & Navigation</h3>
-                            </div>
-
-                            <div className="bg-gradient-to-r from-slate-50 to-blue-50 rounded-xl p-4 border border-slate-200/50">
-                                <div className="flex items-center space-x-3 mb-4">
-                                    <button
-                                        onClick={handleZoomOut}
-                                        className="w-10 h-10 bg-white hover:bg-slate-100 rounded-lg shadow-sm border border-slate-200 transition-all duration-200 hover:shadow-md flex items-center justify-center"
-                                    >
-                                        <svg className="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" />
-                                        </svg>
-                                    </button>
-                                    <div className="flex-1 relative">
-                                        <input
-                                            type="range"
-                                            min="25"
-                                            max="1000"
-                                            value={zoom}
-                                            onChange={handleZoomChange}
-                                            className="w-full h-3 bg-slate-200 rounded-lg appearance-none cursor-pointer slider"
-                                        />
-                                        <div className="absolute -top-8 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-2 py-1 rounded text-xs font-medium">
-                                            {zoom}%
-                                        </div>
-                                    </div>
-                                    <button
-                                        onClick={handleZoomIn}
-                                        className="w-10 h-10 bg-white hover:bg-slate-100 rounded-lg shadow-sm border border-slate-200 transition-all duration-200 hover:shadow-md flex items-center justify-center"
-                                    >
-                                        <svg className="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                                        </svg>
-                                    </button>
-                                </div>
-
-                                <div className="grid grid-cols-2 gap-2">
-                                    <button
-                                        onClick={zoomToFit}
-                                        className="px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 text-white rounded-lg hover:from-green-600 hover:to-emerald-600 transition-all duration-200 text-sm font-semibold shadow-sm hover:shadow-md"
-                                    >
-                                        Fit to Screen
-                                    </button>
-                                    <button
-                                        onClick={resetView}
-                                        className="px-4 py-2 bg-gradient-to-r from-slate-500 to-slate-600 text-white rounded-lg hover:from-slate-600 hover:to-slate-700 transition-all duration-200 text-sm font-semibold shadow-sm hover:shadow-md"
-                                    >
-                                        Reset View
-                                    </button>
+            <div className="container mx-auto px-6 py-4">
+                {/* Professional Compact Controls */}
+                <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-lg border border-white/20 p-4 mb-6">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                        {/* Zoom Controls */}
+                        <div className="flex items-center">
+                            <button
+                                onClick={handleZoomOut}
+                                className="w-12 h-12 bg-white hover:bg-slate-100 rounded-l-xl border border-slate-200 transition-all duration-200 flex items-center justify-center shadow-md"
+                            >
+                                <svg className="w-6 h-6 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" />
+                                </svg>
+                            </button>
+                            <div className="flex-1 relative min-w-[150px]">
+                                <input
+                                    type="range"
+                                    min="25"
+                                    max="1000"
+                                    value={zoom}
+                                    onChange={handleZoomChange}
+                                    className="w-full h-3 bg-slate-200 appearance-none cursor-pointer slider"
+                                />
+                                <div className="absolute -top-8 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-3 py-1 rounded-lg text-sm font-medium">
+                                    {zoom}%
                                 </div>
                             </div>
+                            <button
+                                onClick={handleZoomIn}
+                                className="w-12 h-12 bg-white hover:bg-slate-100 rounded-r-xl border-l-0 border border-slate-200 transition-all duration-200 flex items-center justify-center shadow-md"
+                            >
+                                <svg className="w-6 h-6 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                                </svg>
+                            </button>
                         </div>
 
-                        {/* Enhanced Calibration Controls */}
-                        <div className="space-y-4">
-                            <div className="flex items-center space-x-3 mb-4">
-                                <div className="w-8 h-8 bg-gradient-to-br from-green-500 to-emerald-500 rounded-lg flex items-center justify-center">
-                                    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        {/* View Controls */}
+                        <div className="flex items-center">
+                            <button
+                                onClick={zoomToFit}
+                                className="px-3 py-2 bg-gradient-to-r from-green-500 to-emerald-500 text-white rounded-l-lg hover:from-green-600 hover:to-emerald-600 transition-all duration-200 text-xs font-medium shadow-md"
+                            >
+                                Fit
+                            </button>
+                            <button
+                                onClick={resetView}
+                                className="px-3 py-2 bg-gradient-to-r from-slate-500 to-slate-600 text-white rounded-r-lg hover:from-slate-600 hover:to-slate-700 transition-all duration-200 text-xs font-medium shadow-md border-l border-slate-400"
+                            >
+                                Reset
+                            </button>
+                        </div>
+
+                        {/* Calibration */}
+                        <div className="flex items-center">
+                            <button
+                                onClick={() => setIsCalibrationMode(!isCalibrationMode)}
+                                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 shadow-md ${isCalibrationMode
+                                    ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
+                                    : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
+                                    }`}
+                            >
+                                <div className="flex items-center space-x-1">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
                                     </svg>
+                                    <span>{isCalibrationMode ? 'Active' : 'Calibrate'}</span>
                                 </div>
-                                <h3 className="text-lg font-bold text-slate-800">Calibration</h3>
-                            </div>
+                            </button>
+                            {isCalibrationMode && (
+                                <div className="flex items-center ml-2">
+                                    <span className="text-sm text-slate-700">Ref:</span>
+                                    <input
+                                        type="number"
+                                        min="0.1"
+                                        step="0.1"
+                                        value={calibrationMeters}
+                                        onChange={(e) => setCalibrationMeters(parseFloat(e.target.value) || 1)}
+                                        className="w-20 px-3 py-2 border border-slate-300 rounded-lg text-center text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 ml-1"
+                                    />
+                                    <span className="text-sm text-slate-700 ml-1">m</span>
+                                </div>
+                            )}
+                        </div>
 
-                            <div className="bg-gradient-to-r from-green-50 to-emerald-50 rounded-xl p-4 border border-green-200/50">
+                        {/* Shapes quick action */}
+                        <div className="flex items-center">
+                            {shapes.length > 0 && (
                                 <button
-                                    onClick={() => setIsCalibrationMode(!isCalibrationMode)}
-                                    className={`w-full px-4 py-3 rounded-xl text-sm font-bold transition-all duration-200 shadow-sm hover:shadow-md ${isCalibrationMode
+                                    onClick={() => setShapes([])}
+                                    className="px-3 py-2 bg-gradient-to-r from-orange-500 to-red-500 text-white rounded-lg hover:from-orange-600 hover:to-red-600 transition-all duration-200 text-xs font-medium shadow-md"
+                                >
+                                    Clear Shapes ({shapes.length})
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Draw Button (Select removed; selection is always available) */}
+                        <div className="flex items-center">
+                            <button
+                                onClick={() => handleModeChange('draw')}
+                                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 shadow-md ${currentMode === 'draw'
+                                    ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700'
+                                    : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
+                                    }`}
+                            >
+                                <div className="flex items-center space-x-1">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                                    </svg>
+                                    <span>Draw</span>
+                                </div>
+                            </button>
+                        </div>
+
+                        {/* Drawing Tools (only show in draw mode) */}
+                        {currentMode === 'draw' && (
+                            <div className="flex items-center">
+                                <button
+                                    onClick={() => setDrawingMode(drawingMode === 'line' ? null : 'line')}
+                                    className={`px-3 py-2 rounded-l-lg text-xs font-medium transition-all duration-200 shadow-md ${drawingMode === 'line'
                                         ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
                                         : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
                                         }`}
                                 >
-                                    <div className="flex items-center justify-center space-x-2">
+                                    <div className="flex items-center space-x-1">
                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14" />
                                         </svg>
-                                        <span>{isCalibrationMode ? 'Calibrating...' : 'Start Calibration'}</span>
+                                        <span>Line</span>
                                     </div>
                                 </button>
-
-                                {isCalibrationMode && (
-                                    <div className="mt-4 p-3 bg-white rounded-lg border border-green-200">
-                                        <div className="flex items-center space-x-3">
-                                            <span className="text-sm font-semibold text-slate-700">Reference:</span>
-                                            <input
-                                                type="number"
-                                                min="0.1"
-                                                step="0.1"
-                                                value={calibrationMeters}
-                                                onChange={(e) => setCalibrationMeters(parseFloat(e.target.value) || 1)}
-                                                className="w-20 px-3 py-2 border border-slate-300 rounded-lg text-center text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500"
-                                            />
-                                            <span className="text-sm font-semibold text-slate-700">meters</span>
-                                        </div>
-                                    </div>
-                                )}
-
-                                {calibration && (
-                                    <div className="mt-4 p-3 bg-gradient-to-r from-green-100 to-emerald-100 rounded-lg border border-green-300">
-                                        <div className="flex items-center space-x-2">
-                                            <svg className="w-5 h-5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                            </svg>
-                                            <span className="text-sm font-bold text-green-800">
-                                                {calibration.pixelsPerMeter.toFixed(1)} px/m
-                                            </span>
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-
-                        {/* Enhanced Selection Controls */}
-                        <div className="space-y-4">
-                            <div className="flex items-center space-x-3 mb-4">
-                                <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-indigo-500 rounded-lg flex items-center justify-center">
-                                    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
-                                    </svg>
-                                </div>
-                                <h3 className="text-lg font-bold text-slate-800">Area Selection</h3>
-                            </div>
-
-                            <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl p-4 border border-blue-200/50">
                                 <button
-                                    onClick={() => setIsSelectionMode(!isSelectionMode)}
-                                    className={`w-full px-4 py-3 rounded-xl text-sm font-bold transition-all duration-200 shadow-sm hover:shadow-md ${isSelectionMode
-                                        ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700'
+                                    onClick={() => setDrawingMode(drawingMode === 'circle' ? null : 'circle')}
+                                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'circle'
+                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
                                         : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
                                         }`}
                                 >
-                                    <div className="flex items-center justify-center space-x-2">
+                                    <div className="flex items-center space-x-1">
                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.122 2.122" />
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                                         </svg>
-                                        <span>{isSelectionMode ? 'Selection Active' : 'Start Selection'}</span>
+                                        <span>Circle</span>
                                     </div>
                                 </button>
-
-                                {selections.length > 0 && (
-                                    <button
-                                        onClick={clearSelections}
-                                        className="w-full mt-3 px-4 py-2 bg-gradient-to-r from-red-500 to-pink-500 text-white rounded-lg hover:from-red-600 hover:to-pink-600 transition-all duration-200 text-sm font-semibold shadow-sm hover:shadow-md"
-                                    >
-                                        Clear All ({selections.length})
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-
-                        {/* Enhanced Status */}
-                        <div className="space-y-4">
-                            <div className="flex items-center space-x-3 mb-4">
-                                <div className="w-8 h-8 bg-gradient-to-br from-slate-500 to-slate-600 rounded-lg flex items-center justify-center">
-                                    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                    </svg>
-                                </div>
-                                <h3 className="text-lg font-bold text-slate-800">Status</h3>
-                            </div>
-
-                            <div className="bg-gradient-to-r from-slate-50 to-gray-50 rounded-xl p-4 border border-slate-200/50 space-y-3">
-                                <div className="flex items-center space-x-3 p-3 bg-white rounded-lg border border-slate-200">
-                                    <div className={`w-3 h-3 rounded-full ${file ? 'bg-green-500 animate-pulse' : 'bg-slate-400'}`}></div>
-                                    <span className="text-sm font-semibold text-slate-700">
-                                        {file ? 'PDF Loaded' : 'No PDF'}
-                                    </span>
-                                </div>
-
-                                {calibration && (
-                                    <div className="flex items-center space-x-3 p-3 bg-gradient-to-r from-green-100 to-emerald-100 rounded-lg border border-green-300">
-                                        <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
-                                        <span className="text-sm font-bold text-green-800">
-                                            Calibrated & Ready
-                                        </span>
+                                <button
+                                    onClick={() => setDrawingMode(drawingMode === 'rectangle' ? null : 'rectangle')}
+                                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'rectangle'
+                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
+                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
+                                        }`}
+                                >
+                                    <div className="flex items-center space-x-1">
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                                        </svg>
+                                        <span>Rect</span>
+                                    </div>
+                                </button>
+                                <button
+                                    onClick={() => setDrawingMode(drawingMode === 'polygon' ? null : 'polygon')}
+                                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'polygon'
+                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
+                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
+                                        }`}
+                                >
+                                    <div className="flex items-center space-x-1">
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                                        </svg>
+                                        <span>Poly</span>
+                                    </div>
+                                </button>
+                                <button
+                                    onClick={() => setDrawingMode(drawingMode === 'fill' ? null : 'fill')}
+                                    className={`px-3 py-2 rounded-r-lg text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'fill'
+                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
+                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
+                                        }`}
+                                >
+                                    <div className="flex items-center space-x-1">
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zM21 5a2 2 0 00-2-2h-4a2 2 0 00-2 2v12a4 4 0 004 4h4a2 2 0 002-2V5z" />
+                                        </svg>
+                                        <span>Fill</span>
+                                    </div>
+                                </button>
+                                {drawingMode === 'fill' && (
+                                    <div className="flex items-center ml-1">
+                                        <input
+                                            type="color"
+                                            value={fillColor}
+                                            onChange={(e) => setFillColor(e.target.value)}
+                                            className="w-6 h-6 rounded border border-slate-300 cursor-pointer"
+                                            title="Fill Color"
+                                        />
                                     </div>
                                 )}
-
-                                <div className="flex items-center space-x-3 p-3 bg-white rounded-lg border border-slate-200">
-                                    <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
-                                    <span className="text-sm font-semibold text-slate-700">
-                                        {selections.length} Areas Selected
-                                    </span>
-                                </div>
                             </div>
-                        </div>
+                        )}
+
+                        {/* Curve mode toggle removed; curve is always on for polygons */}
+
+                        {/* Status panel removed as requested */}
                     </div>
                 </div>
 
@@ -660,16 +1479,19 @@ export default function SimplePdfViewer() {
                             style={{
                                 width: '100%',
                                 height: '700px',
-                                cursor: isCalibrationMode
-                                    ? (isCalibrating ? 'crosshair' : 'crosshair')
-                                    : isSelectionMode
-                                        ? (isSelecting ? 'crosshair' : 'crosshair')
-                                        : (isPanning ? 'grabbing' : 'grab')
+                                cursor: hoverCursor
+                                    ? hoverCursor
+                                    : isCalibrationMode
+                                        ? (isCalibrating ? 'crosshair' : 'crosshair')
+                                        : isSelectionMode
+                                            ? (isSelecting ? 'crosshair' : 'crosshair')
+                                            : (drawingMode ? 'crosshair' : (isPanning ? 'grabbing' : 'grab'))
                             }}
                             onMouseDown={handleMouseDown}
                             onMouseMove={handleMouseMove}
                             onMouseUp={handleMouseUp}
                             onMouseLeave={handleMouseUp}
+                            onDoubleClick={handleDoubleClick}
                         >
 
 
