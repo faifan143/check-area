@@ -83,6 +83,8 @@ export default function SimplePdfViewer() {
     const [isCalibNameModalOpen, setIsCalibNameModalOpen] = useState(false);
     const [pendingCalibrationBase, setPendingCalibrationBase] = useState<Calibration | null>(null);
     const [pendingCalibrationName, setPendingCalibrationName] = useState('');
+    const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
+    const [deleteTarget, setDeleteTarget] = useState<'shape' | 'calibration' | null>(null);
 
     const deleteActiveCalibration = useCallback(() => {
         if (!activeCalibrationName) return;
@@ -827,6 +829,9 @@ export default function SimplePdfViewer() {
                     setDraggingShape(clickedShape.id);
                     setLastDragPdfPoint(pdfPoint);
                     return;
+                } else if (!clickedShape && e.button === 0) {
+                    // Clicked empty canvas: clear selection
+                    handleShapeSelect(null);
                 }
             }
         }
@@ -1833,6 +1838,18 @@ export default function SimplePdfViewer() {
             <div className="container mx-auto px-6 py-4">
                 {/* Professional Compact Controls */}
                 <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-lg border border-white/20 p-3 mb-6">
+                    {isDeleteConfirmOpen && createPortal(
+                        <div className="fixed inset-0 z-[2147483647] flex items-center justify-center">
+                            <div className="absolute inset-0 bg-black/45" onClick={() => { setIsDeleteConfirmOpen(false); setDeleteTarget(null); }}></div>
+                            <div className="relative bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm p-4">
+                                <div className="text-sm font-semibold text-slate-800 mb-2">Confirm delete</div>
+                                <div className="text-xs text-slate-600 mb-3">Are you sure you want to delete this {deleteTarget === 'shape' ? 'shape' : 'calibration'}?</div>
+                                <div className="mt-2 flex justify-end gap-2">
+                                    <button onClick={() => { setIsDeleteConfirmOpen(false); setDeleteTarget(null); }} className="h-8 px-3 rounded-md border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 text-xs">Cancel</button>
+                                    <button onClick={() => { if (deleteTarget === 'shape') { deleteSelectedShape(); } else if (deleteTarget === 'calibration') { deleteActiveCalibration(); } setIsDeleteConfirmOpen(false); setDeleteTarget(null); }} className="h-8 px-3 rounded-md bg-red-600 text-white text-xs">Delete</button>
+                                </div>
+                            </div>
+                        </div>, document.body)}
                     {isCalibNameModalOpen && createPortal(
                         <div className="fixed inset-0 z-[2147483647] flex items-center justify-center">
                             <div className="absolute inset-0 bg-black/45" onClick={() => { setIsCalibNameModalOpen(false); setIsCalibrating(false); setIsCalibrationMode(false); setPendingCalibrationBase(null); }}></div>
@@ -1908,7 +1925,7 @@ export default function SimplePdfViewer() {
                                 <option value="__new__">+ New calibration…</option>
                             </select>
                             {activeCalibrationName && (
-                                <button onClick={deleteActiveCalibration} title="Delete calibration" className="h-8 px-2 rounded-md border border-red-200 text-red-700 bg-white hover:bg-red-50 text-xs">
+                                <button onClick={() => { setDeleteTarget('calibration'); setIsDeleteConfirmOpen(true); }} title="Delete calibration" className="h-8 px-2 rounded-md border border-red-200 text-red-700 bg-white hover:bg-red-50 text-xs">
                                     Delete
                                 </button>
                             )}
@@ -1927,7 +1944,7 @@ export default function SimplePdfViewer() {
                                 {drawEnabled ? 'Draw On' : 'Draw Off'}
                             </button>
                             {selectedShapeId && (
-                                <button onClick={deleteSelectedShape} className="h-8 px-3 rounded-md text-xs bg-red-600 text-white">Delete</button>
+                                <button onClick={() => { setDeleteTarget('shape'); setIsDeleteConfirmOpen(true); }} className="h-8 px-3 rounded-md text-xs bg-red-600 text-white">Delete</button>
                             )}
                         </div>
                     </div>
