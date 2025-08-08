@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/esm/Page/AnnotationLayer.css";
 import "react-pdf/dist/esm/Page/TextLayer.css";
@@ -22,6 +23,13 @@ interface Calibration {
     pixelsPerMeter: number;
     referenceLength: number; // pixels
     referenceMeters: number; // actual meters
+    start?: { x: number; y: number }; // calibration line start (PDF coords)
+    end?: { x: number; y: number };   // calibration line end (PDF coords)
+}
+
+// A named calibration system the user can select from
+interface NamedCalibration extends Calibration {
+    name: string;
 }
 
 interface EdgeControl {
@@ -41,6 +49,7 @@ interface Shape {
     bezierPoints?: number[][];
     fillColor?: string; // Fill color for filled areas
     filled?: boolean; // Whether the shape is filled
+    holes?: number[][]; // Optional holes (each is a flat [x1,y1,...])
 }
 
 export default function SimplePdfViewer() {
@@ -64,8 +73,30 @@ export default function SimplePdfViewer() {
     const [isCalibrating, setIsCalibrating] = useState(false);
     const [calibrationStart, setCalibrationStart] = useState({ x: 0, y: 0 });
     const [calibrationEnd, setCalibrationEnd] = useState({ x: 0, y: 0 });
+    // Backward-compatible single calibration currently applied (derived from list)
     const [calibration, setCalibration] = useState<Calibration | null>(null);
     const [calibrationMeters, setCalibrationMeters] = useState(1);
+    const [calibrationUnit, setCalibrationUnit] = useState<'m' | 'cm'>('m');
+    // Multiple calibration systems
+    const [calibrations, setCalibrations] = useState<NamedCalibration[]>([]);
+    const [activeCalibrationName, setActiveCalibrationName] = useState<string | null>(null);
+    const [isCalibNameModalOpen, setIsCalibNameModalOpen] = useState(false);
+    const [pendingCalibrationBase, setPendingCalibrationBase] = useState<Calibration | null>(null);
+    const [pendingCalibrationName, setPendingCalibrationName] = useState('');
+
+    const deleteActiveCalibration = useCallback(() => {
+        if (!activeCalibrationName) return;
+        setCalibrations(prev => {
+            const arr = prev.filter(c => c.name !== activeCalibrationName);
+            try { sessionStorage.setItem('calibrations', JSON.stringify(arr)); } catch { }
+            return arr;
+        });
+        setActiveCalibrationName(null);
+        setCalibration(null);
+        try { sessionStorage.removeItem('activeCalibration'); } catch { }
+        setSelections(prev => prev.map(s => ({ ...s, areaInMeters: 0 })));
+        setIsCalibrationMode(false);
+    }, [activeCalibrationName]);
 
     // Drawing state
     const [drawingMode, setDrawingMode] = useState<'circle' | 'rectangle' | 'polygon' | 'line' | 'fill' | null>(null);
@@ -82,9 +113,11 @@ export default function SimplePdfViewer() {
     const [dragOffset, setDragOffset] = useState<{ x: number; y: number } | null>(null);
     const [resizing, setResizing] = useState<{ shapeId: string; handleIndex: number } | null>(null);
     const [draggedControlPoint, setDraggedControlPoint] = useState<{ shapeId: string; pointIndex: number; type: 'vertex' | 'edge' } | null>(null);
+    // Floating shape info card visibility and data derive from selection + active calibration
     const [isFloodFilling, setIsFloodFilling] = useState(false);
     const [lastDragPdfPoint, setLastDragPdfPoint] = useState<{ x: number; y: number } | null>(null);
     const [hoverCursor, setHoverCursor] = useState<string | null>(null);
+    // Dynamic fill now uses internal tuned defaults (no UI sliders)
 
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -97,6 +130,48 @@ export default function SimplePdfViewer() {
             setSelections([]);
         }
     };
+
+    // Persist calibrations and shapes in sessionStorage
+    useEffect(() => {
+        // load once
+        const rawCalibs = sessionStorage.getItem('calibrations');
+        if (rawCalibs) {
+            try { setCalibrations(JSON.parse(rawCalibs)); } catch { }
+        }
+        const rawActive = sessionStorage.getItem('activeCalibration');
+        if (rawActive) {
+            setActiveCalibrationName(rawActive);
+            const found = rawCalibs ? (JSON.parse(rawCalibs) as NamedCalibration[]).find(c => c.name === rawActive) : null;
+            if (found) {
+                setCalibration(found);
+                if (found.start && found.end) {
+                    setCalibrationStart(found.start);
+                    setCalibrationEnd(found.end);
+                }
+            }
+        }
+        const rawShapes = sessionStorage.getItem('shapes');
+        if (rawShapes) {
+            try { setShapes(JSON.parse(rawShapes)); } catch { }
+        }
+    }, []);
+
+    useEffect(() => {
+        sessionStorage.setItem('shapes', JSON.stringify(shapes));
+    }, [shapes]);
+
+    useEffect(() => {
+        sessionStorage.setItem('calibrations', JSON.stringify(calibrations));
+        if (activeCalibrationName) sessionStorage.setItem('activeCalibration', activeCalibrationName);
+        else try { sessionStorage.removeItem('activeCalibration'); } catch { }
+    }, [calibrations, activeCalibrationName]);
+
+    useEffect(() => {
+        if (calibration?.start && calibration?.end) {
+            setCalibrationStart(calibration.start);
+            setCalibrationEnd(calibration.end);
+        }
+    }, [calibration]);
 
     const handleZoomChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const newZoom = parseInt(e.target.value);
@@ -275,6 +350,8 @@ export default function SimplePdfViewer() {
                 setDrawingPoints([]);
                 setIsDrawing(false);
                 setMousePosition(null);
+                // Exit drawing phase until user picks a tool again
+                setDrawingMode(null);
             }
         } else if (drawingMode === 'circle') {
             if (drawingPoints.length === 0) {
@@ -298,6 +375,7 @@ export default function SimplePdfViewer() {
                 setDrawingPoints([]);
                 setIsDrawing(false);
                 setMousePosition(null);
+                setDrawingMode(null);
             }
         } else if (drawingMode === 'rectangle') {
             if (drawingPoints.length === 0) {
@@ -318,6 +396,7 @@ export default function SimplePdfViewer() {
                 setDrawingPoints([]);
                 setIsDrawing(false);
                 setMousePosition(null);
+                setDrawingMode(null);
             }
         } else if (drawingMode === 'polygon') {
             // Add point to polygon
@@ -343,6 +422,23 @@ export default function SimplePdfViewer() {
         return [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
     };
 
+    const rgbToHsl = (r: number, g: number, b: number): [number, number, number] => {
+        r /= 255; g /= 255; b /= 255;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        let h = 0, s = 0, l = (max + min) / 2;
+        const d = max - min;
+        if (d !== 0) {
+            s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+            switch (max) {
+                case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+                case g: h = (b - r) / d + 2; break;
+                case b: h = (r - g) / d + 4; break;
+            }
+            h /= 6;
+        }
+        return [h * 360, s * 100, l * 100];
+    };
+
     const colorsMatch = (c1: number[], c2: number[], tol = 6): boolean => {
         return Math.abs(c1[0] - c2[0]) <= tol && Math.abs(c1[1] - c2[1]) <= tol && Math.abs(c1[2] - c2[2]) <= tol;
     };
@@ -350,6 +446,49 @@ export default function SimplePdfViewer() {
     const isDarkPixel = (color: number[], threshold = 120): boolean => {
         const brightness = (color[0] + color[1] + color[2]) / 3;
         return brightness < threshold;
+    };
+
+    // Simple morphology: dilate dark pixels then erode to seal tiny gaps in walls
+    const buildWallMask = (data: Uint8ClampedArray, w: number, h: number, threshold: number, closeRadius: number): Uint8Array => {
+        const mask = new Uint8Array(w * h);
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const idx = (y * w + x) * 4;
+                const bright = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+                mask[y * w + x] = bright < threshold ? 1 : 0;
+            }
+        }
+        if (closeRadius <= 0) return mask;
+        // dilate
+        const dil = new Uint8Array(mask);
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                if (mask[y * w + x]) {
+                    for (let dy = -closeRadius; dy <= closeRadius; dy++) {
+                        for (let dx = -closeRadius; dx <= closeRadius; dx++) {
+                            const nx = x + dx, ny = y + dy;
+                            if (nx >= 0 && nx < w && ny >= 0 && ny < h) dil[ny * w + nx] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        // erode back
+        const ero = new Uint8Array(dil);
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                if (!dil[y * w + x]) continue;
+                let allOn = 1;
+                for (let dy = -closeRadius; dy <= closeRadius && allOn; dy++) {
+                    for (let dx = -closeRadius; dx <= closeRadius; dx++) {
+                        const nx = x + dx, ny = y + dy;
+                        if (nx < 0 || nx >= w || ny < 0 || ny >= h || !dil[ny * w + nx]) { allOn = 0; break; }
+                    }
+                }
+                if (!allOn) ero[y * w + x] = 0;
+            }
+        }
+        return ero;
     };
 
     const traceBoundaryWithMarchingSquares = (boundaryPixels: Array<{ x: number, y: number }>): number[] => {
@@ -427,25 +566,35 @@ export default function SimplePdfViewer() {
             tctx.drawImage(pdfCanvas, x0, y0, roiW, roiH, 0, 0, roiW, roiH);
             const imgData = tctx.getImageData(0, 0, roiW, roiH);
             const data = imgData.data;
+            // Tuned constants for robust results
+            const wallThreshold = 170; // 0-255 brightness considered wall
+            const gapPixels = 2;       // morphological closing kernel radius
+            const fillTolerance = 26;  // color tolerance
+            const maxSaturation = 40;  // exclude highly saturated regions
+            const smoothEpsilon = 4;   // simplification epsilon in px
+            const wallMask = buildWallMask(data, roiW, roiH, wallThreshold, gapPixels);
 
-            const startX = clickX - x0;
-            const startY = clickY - y0;
-            const startColor = getPixelColor(data, startX, startY, roiW);
-            if (isDarkPixel(startColor, 160)) { setIsFloodFilling(false); return; }
-
-            const isBoundary = (x: number, y: number) => {
-                const c = getPixelColor(data, x, y, roiW);
-                if (isDarkPixel(c, 160)) return true;
-                const nb = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
-                for (const [dx, dy] of nb) {
-                    const nx = x + dx, ny = y + dy;
-                    if (nx >= 0 && nx < roiW && ny >= 0 && ny < roiH) {
-                        const cc = getPixelColor(data, nx, ny, roiW);
-                        if (isDarkPixel(cc, 160)) return true;
+            let startX = clickX - x0;
+            let startY = clickY - y0;
+            if (wallMask[startY * roiW + startX] === 1) {
+                let found = false;
+                for (let r = 1; r <= 6 && !found; r++) {
+                    for (let dy = -r; dy <= r && !found; dy++) {
+                        for (let dx = -r; dx <= r; dx++) {
+                            const nx = startX + dx, ny = startY + dy;
+                            if (nx >= 0 && nx < roiW && ny >= 0 && ny < roiH && wallMask[ny * roiW + nx] === 0) {
+                                startX = nx; startY = ny; found = true; break;
+                            }
+                        }
                     }
                 }
-                return false;
-            };
+                if (!found) { setIsFloodFilling(false); return; }
+            }
+            const startColor = getPixelColor(data, startX, startY, roiW);
+            const [, sat] = (() => { const [h, s, l] = rgbToHsl(startColor[0], startColor[1], startColor[2]); return [h, s, l]; })();
+            if (isDarkPixel(startColor, wallThreshold) || sat > maxSaturation) { setIsFloodFilling(false); return; }
+
+            const isBoundary = (x: number, y: number) => wallMask[y * roiW + x] === 1;
 
             const visited = new Set<string>();
             const queue: Array<{ x: number, y: number }> = [{ x: startX, y: startY }];
@@ -456,7 +605,7 @@ export default function SimplePdfViewer() {
                 if (visited.has(key) || p.x < 0 || p.x >= roiW || p.y < 0 || p.y >= roiH) continue;
                 if (isBoundary(p.x, p.y)) continue;
                 const c = getPixelColor(data, p.x, p.y, roiW);
-                if (!colorsMatch(c, startColor, 28)) continue;
+                if (!colorsMatch(c, startColor, fillTolerance)) continue;
                 visited.add(key); filled.push(p);
                 if (filled.length > maxPixels) break;
                 queue.push({ x: p.x + 1, y: p.y });
@@ -472,7 +621,21 @@ export default function SimplePdfViewer() {
                 const neighbors = [{ x: p.x + 1, y: p.y }, { x: p.x - 1, y: p.y }, { x: p.x, y: p.y + 1 }, { x: p.x, y: p.y - 1 }];
                 if (neighbors.some(n => !filledSet.has(`${n.x},${n.y}`))) boundary.push({ x: p.x + x0, y: p.y + y0 });
             }
-            const boundaryPoints = traceBoundaryWithMarchingSquares(boundary);
+            let boundaryPoints = traceBoundaryWithMarchingSquares(boundary);
+            // extra simplification pass
+            if (smoothEpsilon > 0 && boundaryPoints.length > 50) {
+                const eps = smoothEpsilon;
+                const simp: number[] = [];
+                let lastX = boundaryPoints[0], lastY = boundaryPoints[1];
+                simp.push(lastX, lastY);
+                for (let i = 2; i < boundaryPoints.length; i += 2) {
+                    const x = boundaryPoints[i], y = boundaryPoints[i + 1];
+                    if (Math.hypot(x - lastX, y - lastY) >= eps) {
+                        simp.push(x, y); lastX = x; lastY = y;
+                    }
+                }
+                boundaryPoints = simp;
+            }
             if (boundaryPoints.length >= 6) {
                 // convert back to PDF coords
                 const invScale = 1 / (zoom / 100);
@@ -544,6 +707,7 @@ export default function SimplePdfViewer() {
             setDrawingPoints([]);
             setIsDrawing(false);
             setMousePosition(null);
+            setDrawingMode(null);
         }
     }, [drawingMode, drawingPoints, shapes]);
 
@@ -610,7 +774,7 @@ export default function SimplePdfViewer() {
                     }
                 }
 
-                // If selected rectangle, check resize handles
+                // If selected rectangle, check resize handles (corners only) or curve controls (edge midpoints)
                 if (selectedShape && selectedShape.type === 'rectangle') {
                     const [rx, ry, rwidth, rheight] = selectedShape.points;
                     const minX = Math.min(rx, rx + rwidth);
@@ -618,21 +782,40 @@ export default function SimplePdfViewer() {
                     const minY = Math.min(ry, ry + rheight);
                     const maxY = Math.max(ry, ry + rheight);
 
+                    // Resize handles: corners only
                     const handles = [
                         { x: minX, y: minY }, // 0 nw
                         { x: maxX, y: minY }, // 1 ne
                         { x: maxX, y: maxY }, // 2 se
-                        { x: minX, y: maxY }, // 3 sw
-                        { x: (minX + maxX) / 2, y: minY }, // 4 n
-                        { x: (minX + maxX) / 2, y: maxY }, // 5 s
-                        { x: minX, y: (minY + maxY) / 2 }, // 6 w
-                        { x: maxX, y: (minY + maxY) / 2 }  // 7 e
+                        { x: minX, y: maxY }  // 3 sw
                     ];
 
                     for (let i = 0; i < handles.length; i++) {
                         if (Math.hypot(pdfPoint.x - handles[i].x, pdfPoint.y - handles[i].y) <= threshold) {
                             setResizing({ shapeId: selectedShape.id, handleIndex: i });
                             return;
+                        }
+                    }
+
+                    // Curve controls (midpoints) act like polygon edge controls
+                    {
+                        const corners = [
+                            { x: minX, y: minY },
+                            { x: maxX, y: minY },
+                            { x: maxX, y: maxY },
+                            { x: minX, y: maxY }
+                        ];
+                        for (let i = 0; i < 4; i++) {
+                            const a = corners[i];
+                            const b = corners[(i + 1) % 4];
+                            const midX = (a.x + b.x) / 2;
+                            const midY = (a.y + b.y) / 2;
+                            const existing = selectedShape.edgeControls?.find(ec => ec.edgeIndex === i);
+                            const control = existing ? existing.point : { x: midX, y: midY };
+                            if (Math.hypot(pdfPoint.x - control.x, pdfPoint.y - control.y) <= threshold) {
+                                setDraggedControlPoint({ shapeId: selectedShape.id, pointIndex: i * 2, type: 'edge' });
+                                return;
+                            }
                         }
                     }
                 }
@@ -654,11 +837,31 @@ export default function SimplePdfViewer() {
         }
 
         if (isCalibrationMode) {
-            // Start calibration
+            // Two-click calibration with naming dialog
             const coords = getPdfCoordinates(e);
-            setIsCalibrating(true);
-            setCalibrationStart(coords);
-            setCalibrationEnd(coords);
+            if (!isCalibrating) {
+                setIsCalibrating(true);
+                setCalibrationStart(coords);
+                setCalibrationEnd(coords);
+            } else {
+                const length = Math.hypot(coords.x - calibrationStart.x, coords.y - calibrationStart.y);
+                if (length > 10) {
+                    // Convert entered reference to meters
+                    const refMeters = calibrationUnit === 'm' ? calibrationMeters : (calibrationMeters / 100);
+                    const base: Calibration = {
+                        pixelsPerMeter: length / refMeters,
+                        referenceLength: length,
+                        referenceMeters: refMeters,
+                        start: { x: calibrationStart.x, y: calibrationStart.y },
+                        end: { x: coords.x, y: coords.y }
+                    };
+                    setPendingCalibrationBase(base);
+                    setPendingCalibrationName('');
+                    setIsCalibNameModalOpen(true);
+                }
+                // Freeze the preview at this end point until user confirms
+                setIsCalibrating(false);
+            }
         } else if (isSelectionMode) {
             // Start selection
             const coords = getPdfCoordinates(e);
@@ -710,11 +913,14 @@ export default function SimplePdfViewer() {
                 setShapes(prev => prev.map(s => {
                     if (s.id !== draggingShape) return s;
                     let newPoints: number[] = [];
-                    if (s.type === 'line' || s.type === 'polygon' || s.type === 'rectangle' || s.type === 'filled-area') {
+                    if (s.type === 'line' || s.type === 'polygon' || s.type === 'filled-area') {
                         for (let i = 0; i < s.points.length; i += 2) {
                             newPoints.push(s.points[i] + dx);
                             newPoints.push(s.points[i + 1] + dy);
                         }
+                    } else if (s.type === 'rectangle') {
+                        const [rx, ry, rw, rh] = s.points;
+                        newPoints = [rx + dx, ry + dy, rw, rh];
                     } else if (s.type === 'circle') {
                         newPoints = [s.points[0] + dx, s.points[1] + dy, s.points[2]];
                     }
@@ -735,23 +941,71 @@ export default function SimplePdfViewer() {
                 y: (e.clientY - rect.top - pan.y) / (zoom / 100)
             };
             setShapes(prev => prev.map(s => {
-                if (s.id !== draggedControlPoint.shapeId || s.type !== 'polygon') return s;
-                if (draggedControlPoint.type === 'vertex') {
-                    const newPts = [...s.points];
-                    newPts[draggedControlPoint.pointIndex] = pdfPoint.x;
-                    newPts[draggedControlPoint.pointIndex + 1] = pdfPoint.y;
-                    return { ...s, points: newPts };
-                } else {
-                    const edgeIndex = draggedControlPoint.pointIndex / 2;
+                if (s.id !== draggedControlPoint.shapeId) return s;
+                if (s.type === 'polygon') {
+                    if (draggedControlPoint.type === 'vertex') {
+                        const newPts = [...s.points];
+                        newPts[draggedControlPoint.pointIndex] = pdfPoint.x;
+                        newPts[draggedControlPoint.pointIndex + 1] = pdfPoint.y;
+                        return { ...s, points: newPts };
+                    } else {
+                        const edgeIndex = draggedControlPoint.pointIndex / 2;
+                        const newControls = [...(s.edgeControls || [])];
+                        const idx = newControls.findIndex(ec => ec.edgeIndex === edgeIndex);
+                        if (idx >= 0) newControls[idx] = { edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } };
+                        else newControls.push({ edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } });
+                        return { ...s, curveMode: true, edgeControls: newControls };
+                    }
+                } else if (s.type === 'rectangle' && draggedControlPoint.type === 'edge') {
+                    const edgeIndex = Math.floor(draggedControlPoint.pointIndex / 2);
                     const newControls = [...(s.edgeControls || [])];
                     const idx = newControls.findIndex(ec => ec.edgeIndex === edgeIndex);
-                    if (idx >= 0) {
-                        newControls[idx] = { edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } };
-                    } else {
-                        newControls.push({ edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } });
-                    }
-                    return { ...s, edgeControls: newControls };
+                    if (idx >= 0) newControls[idx] = { edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } };
+                    else newControls.push({ edgeIndex, point: { x: pdfPoint.x, y: pdfPoint.y } });
+                    return { ...s, curveMode: true, edgeControls: newControls };
                 }
+                return s;
+            }));
+            return;
+        }
+
+        // Resizing rectangle or circle
+        if (resizing) {
+            const rect = containerRef.current?.getBoundingClientRect();
+            if (!rect) return;
+            const pdfPoint = {
+                x: (e.clientX - rect.left - pan.x) / (zoom / 100),
+                y: (e.clientY - rect.top - pan.y) / (zoom / 100)
+            };
+            setShapes(prev => prev.map(s => {
+                if (s.id !== resizing.shapeId) return s;
+                if (s.type === 'rectangle') {
+                    const [rx, ry, rw, rh] = s.points;
+                    let x0 = Math.min(rx, rx + rw);
+                    let y0 = Math.min(ry, ry + rh);
+                    let x1 = Math.max(rx, rx + rw);
+                    let y1 = Math.max(ry, ry + rh);
+                    switch (resizing.handleIndex) {
+                        case 0: x0 = pdfPoint.x; y0 = pdfPoint.y; break; // nw
+                        case 1: x1 = pdfPoint.x; y0 = pdfPoint.y; break; // ne
+                        case 2: x1 = pdfPoint.x; y1 = pdfPoint.y; break; // se
+                        case 3: x0 = pdfPoint.x; y1 = pdfPoint.y; break; // sw
+                        case 4: y0 = pdfPoint.y; break; // n
+                        case 5: y1 = pdfPoint.y; break; // s
+                        case 6: x0 = pdfPoint.x; break; // w
+                        case 7: x1 = pdfPoint.x; break; // e
+                    }
+                    const nx = x0;
+                    const ny = y0;
+                    const nw = x1 - x0;
+                    const nh = y1 - y0;
+                    return { ...s, points: [nx, ny, nw, nh] };
+                } else if (s.type === 'circle') {
+                    const [cx, cy] = s.points;
+                    const r = Math.max(1, Math.hypot(pdfPoint.x - cx, pdfPoint.y - cy));
+                    return { ...s, points: [cx, cy, r] };
+                }
+                return s;
             }));
             return;
         }
@@ -774,7 +1028,7 @@ export default function SimplePdfViewer() {
                         const vx = selectedShape.points[i];
                         const vy = selectedShape.points[i + 1];
                         if (Math.hypot(pdfPoint.x - vx, pdfPoint.y - vy) <= threshold) {
-                            cursor = 'grab';
+                            cursor = 'pointer';
                             break;
                         }
                     }
@@ -786,14 +1040,14 @@ export default function SimplePdfViewer() {
                             const existing = selectedShape.edgeControls?.find(ec => ec.edgeIndex === i / 2);
                             const cp = existing ? existing.point : { x: midX, y: midY };
                             if (Math.hypot(pdfPoint.x - cp.x, pdfPoint.y - cp.y) <= threshold) {
-                                cursor = 'grab';
+                                cursor = 'pointer';
                                 break;
                             }
                         }
                     }
                 }
 
-                // Check rectangle resize handles
+                // Check rectangle resize handles (corners only)
                 if (!cursor && selectedShape && selectedShape.type === 'rectangle') {
                     const [rx, ry, rwidth, rheight] = selectedShape.points;
                     const minX = Math.min(rx, rx + rwidth);
@@ -804,15 +1058,28 @@ export default function SimplePdfViewer() {
                         { x: minX, y: minY },
                         { x: maxX, y: minY },
                         { x: maxX, y: maxY },
-                        { x: minX, y: maxY },
-                        { x: (minX + maxX) / 2, y: minY },
-                        { x: (minX + maxX) / 2, y: maxY },
-                        { x: minX, y: (minY + maxY) / 2 },
-                        { x: maxX, y: (minY + maxY) / 2 }
+                        { x: minX, y: maxY }
                     ];
                     for (let i = 0; i < handles.length; i++) {
                         if (Math.hypot(pdfPoint.x - handles[i].x, pdfPoint.y - handles[i].y) <= threshold) {
-                            cursor = i <= 3 ? 'nwse-resize' : 'ew-resize';
+                            cursor = 'nwse-resize';
+                            break;
+                        }
+                    }
+                }
+
+                // Check circle resize handles (N,E,S,W)
+                if (!cursor && selectedShape && selectedShape.type === 'circle') {
+                    const [cx, cy, r] = selectedShape.points;
+                    const handles = [
+                        { x: cx + r, y: cy },
+                        { x: cx - r, y: cy },
+                        { x: cx, y: cy - r },
+                        { x: cx, y: cy + r }
+                    ];
+                    for (let i = 0; i < handles.length; i++) {
+                        if (Math.hypot(pdfPoint.x - handles[i].x, pdfPoint.y - handles[i].y) <= threshold) {
+                            cursor = i >= 2 ? 'ns-resize' : 'ew-resize';
                             break;
                         }
                     }
@@ -862,29 +1129,8 @@ export default function SimplePdfViewer() {
             setResizing(null);
         }
         if (isCalibrating) {
-            // Finish calibration
-            const length = Math.sqrt(
-                Math.pow(calibrationEnd.x - calibrationStart.x, 2) +
-                Math.pow(calibrationEnd.y - calibrationStart.y, 2)
-            );
-
-            if (length > 10) { // Minimum calibration length
-                const newCalibration: Calibration = {
-                    pixelsPerMeter: length / calibrationMeters,
-                    referenceLength: length,
-                    referenceMeters: calibrationMeters
-                };
-
-                setCalibration(newCalibration);
-
-                // Recalculate areas for existing selections
-                setSelections(prev => prev.map(selection => ({
-                    ...selection,
-                    areaInMeters: selection.area / (newCalibration.pixelsPerMeter * newCalibration.pixelsPerMeter)
-                })));
-            }
-
-            setIsCalibrating(false);
+            // Do nothing on mouse up; finalize on second click (mouse down)
+            return;
         } else if (isSelecting) {
             // Finish selection
             const width = Math.abs(selectionEnd.x - selectionStart.x);
@@ -998,11 +1244,11 @@ export default function SimplePdfViewer() {
         }
 
         // Draw calibration line
-        if (isCalibrating) {
+        if (isCalibrating || calibration) {
             const startX = calibrationStart.x * (zoom / 100);
             const startY = calibrationStart.y * (zoom / 100);
-            const endX = calibrationEnd.x * (zoom / 100);
-            const endY = calibrationEnd.y * (zoom / 100);
+            const endX = (isCalibrating ? calibrationEnd.x : (calibration?.end?.x ?? calibrationEnd.x)) * (zoom / 100);
+            const endY = (isCalibrating ? calibrationEnd.y : (calibration?.end?.y ?? calibrationEnd.y)) * (zoom / 100);
 
             ctx.strokeStyle = '#10b981';
             ctx.lineWidth = 3;
@@ -1012,18 +1258,6 @@ export default function SimplePdfViewer() {
             ctx.lineTo(endX, endY);
             ctx.stroke();
             ctx.setLineDash([]);
-
-            // Draw calibration label
-            const midX = (startX + endX) / 2;
-            const midY = (startY + endY) / 2;
-            const length = Math.sqrt(
-                Math.pow(calibrationEnd.x - calibrationStart.x, 2) +
-                Math.pow(calibrationEnd.y - calibrationStart.y, 2)
-            );
-
-            ctx.fillStyle = '#10b981';
-            ctx.font = 'bold 16px Arial';
-            ctx.fillText(`${calibrationMeters}m (${length.toFixed(1)}px)`, midX + 20, midY - 20);
         }
 
         // Draw existing calibration line
@@ -1047,7 +1281,7 @@ export default function SimplePdfViewer() {
 
             ctx.fillStyle = '#059669';
             ctx.font = 'bold 14px Arial';
-            ctx.fillText(`${calibration.referenceMeters}m`, midX + 10, midY - 10);
+            ctx.fillText(`${calibration?.referenceMeters ?? calibrationMeters}m`, midX + 10, midY - 10);
         }
 
         // Draw shapes
@@ -1073,6 +1307,25 @@ export default function SimplePdfViewer() {
                     // Fill with semi-transparent color
                     ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
                     ctx.fill();
+
+                    // Resize handles when selected
+                    if (shape.selected) {
+                        const handlePoints = [
+                            { x: (centerX + radius) * scale, y: centerY * scale },
+                            { x: (centerX - radius) * scale, y: centerY * scale },
+                            { x: centerX * scale, y: (centerY - radius) * scale },
+                            { x: centerX * scale, y: (centerY + radius) * scale }
+                        ];
+                        ctx.fillStyle = '#ffffff';
+                        ctx.strokeStyle = '#000000';
+                        ctx.lineWidth = 2;
+                        handlePoints.forEach(h => {
+                            ctx.beginPath();
+                            ctx.arc(h.x, h.y, 5, 0, 2 * Math.PI);
+                            ctx.fill();
+                            ctx.stroke();
+                        });
+                    }
                     break;
 
                 case 'rectangle':
@@ -1084,11 +1337,88 @@ export default function SimplePdfViewer() {
 
                     ctx.strokeStyle = shape.selected ? '#ff0000' : shape.color;
                     ctx.lineWidth = shape.selected ? 3 : shape.strokeWidth;
-                    ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
 
-                    // Fill with semi-transparent color
-                    ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
-                    ctx.fillRect(scaledX, scaledY, scaledWidth, scaledHeight);
+                    // If curve mode enabled for rectangle, draw each edge possibly curved
+                    if (shape.curveMode) {
+                        const corners = [
+                            { x: x, y: y },
+                            { x: x + width, y: y },
+                            { x: x + width, y: y + height },
+                            { x: x, y: y + height }
+                        ];
+                        ctx.beginPath();
+                        ctx.moveTo(corners[0].x * scale, corners[0].y * scale);
+                        for (let i = 0; i < 4; i++) {
+                            const a = corners[i];
+                            const b = corners[(i + 1) % 4];
+                            const ec = shape.edgeControls?.find(ec => ec.edgeIndex === i);
+                            if (ec) {
+                                ctx.quadraticCurveTo(ec.point.x * scale, ec.point.y * scale, b.x * scale, b.y * scale);
+                            } else {
+                                ctx.lineTo(b.x * scale, b.y * scale);
+                            }
+                        }
+                        ctx.closePath();
+                        ctx.stroke();
+                        ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
+                        ctx.fill();
+                    } else {
+                        ctx.strokeRect(scaledX, scaledY, scaledWidth, scaledHeight);
+                        ctx.fillStyle = shape.color === '#ef4444' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(59, 130, 246, 0.2)';
+                        ctx.fillRect(scaledX, scaledY, scaledWidth, scaledHeight);
+                    }
+
+                    // Resize handles when selected
+                    if (shape.selected) {
+                        const handles = [
+                            { x: scaledX, y: scaledY },
+                            { x: scaledX + scaledWidth, y: scaledY },
+                            { x: scaledX + scaledWidth, y: scaledY + scaledHeight },
+                            { x: scaledX, y: scaledY + scaledHeight }
+                        ];
+                        ctx.fillStyle = '#ffffff';
+                        ctx.strokeStyle = '#000000';
+                        ctx.lineWidth = 2;
+                        handles.forEach(h => {
+                            ctx.beginPath();
+                            ctx.arc(h.x, h.y, 5, 0, 2 * Math.PI);
+                            ctx.fill();
+                            ctx.stroke();
+                        });
+
+                        // Curve controls on each edge (midpoints), shown in different color
+                        const corners = [
+                            { x: x, y: y },
+                            { x: x + width, y: y },
+                            { x: x + width, y: y + height },
+                            { x: x, y: y + height }
+                        ];
+                        for (let i = 0; i < 4; i++) {
+                            const a = corners[i];
+                            const b = corners[(i + 1) % 4];
+                            const midX = (a.x + b.x) / 2;
+                            const midY = (a.y + b.y) / 2;
+                            const ec = shape.edgeControls?.find(ec => ec.edgeIndex === i);
+                            const cp = ec ? ec.point : { x: midX, y: midY };
+                            if (ec) {
+                                ctx.strokeStyle = '#999999';
+                                ctx.lineWidth = 1;
+                                ctx.setLineDash([3, 3]);
+                                ctx.beginPath();
+                                ctx.moveTo(midX * scale, midY * scale);
+                                ctx.lineTo(cp.x * scale, cp.y * scale);
+                                ctx.stroke();
+                                ctx.setLineDash([]);
+                            }
+                            ctx.fillStyle = ec ? '#4ecdc4' : '#dddddd';
+                            ctx.strokeStyle = '#666666';
+                            ctx.lineWidth = 1;
+                            ctx.beginPath();
+                            ctx.arc(cp.x * scale, cp.y * scale, 5, 0, 2 * Math.PI);
+                            ctx.fill();
+                            ctx.stroke();
+                        }
+                    }
                     break;
 
                 case 'line':
@@ -1229,6 +1559,8 @@ export default function SimplePdfViewer() {
             ctx.restore();
         });
 
+        // No-op: drawing preview handled below
+
         // Draw drawing preview
         if (isDrawing && drawingPoints.length > 0 && mousePosition) {
             ctx.save();
@@ -1342,6 +1674,110 @@ export default function SimplePdfViewer() {
             ctx.restore();
         }
 
+        // Floating info card near selected shape when calibration active
+        if (selectedShapeId && calibration) {
+            const ppm = calibration.pixelsPerMeter;
+            const toMeters = (px: number) => px / ppm;
+            const toMetersSq = (px2: number) => px2 / (ppm * ppm);
+            let cx = 0, cy = 0;
+            let lines: string[] = [];
+            const s = shapes.find(sh => sh.id === selectedShapeId);
+            if (s) {
+                switch (s.type) {
+                    case 'rectangle': {
+                        const [x, y, w, h] = s.points;
+                        cx = x + w; cy = y;
+                        const corners = [
+                            { x: x, y: y },
+                            { x: x + w, y: y },
+                            { x: x + w, y: y + h },
+                            { x: x, y: y + h }
+                        ];
+                        const ecList = s.edgeControls || [];
+                        const samples: { x: number; y: number }[] = [];
+                        const samplesPerEdge = 16;
+                        for (let i = 0; i < 4; i++) {
+                            const a = corners[i];
+                            const b = corners[(i + 1) % 4];
+                            const ec = ecList.find(e => e.edgeIndex === i)?.point;
+                            for (let t = 0; t <= samplesPerEdge; t++) {
+                                const u = t / samplesPerEdge;
+                                let px: number, py: number;
+                                if (s.curveMode && ec) {
+                                    const oneMinus = 1 - u;
+                                    px = oneMinus * oneMinus * a.x + 2 * oneMinus * u * ec.x + u * u * b.x;
+                                    py = oneMinus * oneMinus * a.y + 2 * oneMinus * u * ec.y + u * u * b.y;
+                                } else {
+                                    px = a.x + (b.x - a.x) * u;
+                                    py = a.y + (b.y - a.y) * u;
+                                }
+                                samples.push({ x: px, y: py });
+                            }
+                        }
+                        let area = 0; let peri = 0;
+                        for (let i = 0; i < samples.length; i++) {
+                            const j = (i + 1) % samples.length;
+                            const p = samples[i], q = samples[j];
+                            area += p.x * q.y - q.x * p.y;
+                            peri += Math.hypot(q.x - p.x, q.y - p.y);
+                        }
+                        area = Math.abs(area / 2);
+                        lines = [
+                            `Rectangle`,
+                            `Area: ${toMetersSq(area).toFixed(2)} m²`,
+                            `Perimeter: ${toMeters(peri).toFixed(2)} m`,
+                            `W×H: ${toMeters(Math.abs(w)).toFixed(2)} × ${toMeters(Math.abs(h)).toFixed(2)} m`
+                        ];
+                        break;
+                    }
+                    case 'circle': {
+                        const [x, y, r] = s.points; cx = x + r; cy = y - r; const area = Math.PI * r * r; const peri = 2 * Math.PI * r;
+                        lines = [
+                            `Circle`,
+                            `Area: ${toMetersSq(area).toFixed(2)} m²`,
+                            `Circumf.: ${toMeters(peri).toFixed(2)} m`,
+                            `D: ${toMeters(2 * r).toFixed(2)} m`
+                        ];
+                        break;
+                    }
+                    case 'line': {
+                        const [x1, y1, x2, y2] = s.points; cx = x2; cy = y2; const len = Math.hypot(x2 - x1, y2 - y1);
+                        lines = [`Line`, `Length: ${toMeters(len).toFixed(2)} m`];
+                        break;
+                    }
+                    default: {
+                        // polygon / filled-area
+                        let area = 0, peri = 0; const pts = s.points; for (let i = 0; i < pts.length; i += 2) { const j = (i + 2) % pts.length; const x1 = pts[i], y1 = pts[i + 1], x2 = pts[j], y2 = pts[j + 1]; area += x1 * y2 - x2 * y1; peri += Math.hypot(x2 - x1, y2 - y1); } area = Math.abs(area / 2);
+                        // centroid approx for label position
+                        let Cx = 0, Cy = 0, A = 0; for (let i = 0; i < pts.length; i += 2) { const j = (i + 2) % pts.length; const x1 = pts[i], y1 = pts[i + 1], x2 = pts[j], y2 = pts[j + 1]; const a = x1 * y2 - x2 * y1; A += a; Cx += (x1 + x2) * a; Cy += (y1 + y2) * a; } A = A / 2; Cx = Cx / (6 * A); Cy = Cy / (6 * A); cx = Cx; cy = Cy;
+                        lines = [`Area`, `Area: ${toMetersSq(area).toFixed(2)} m²`, `Perimeter: ${toMeters(peri).toFixed(2)} m`];
+                    }
+                }
+
+                const sx = cx * (zoom / 100);
+                const sy = cy * (zoom / 100);
+                const cardX = sx + 10;
+                const cardY = sy - 10;
+                const padX = 10, padY = 8;
+                ctx.save();
+                ctx.font = '12px Arial';
+                const textWidth = Math.max(...lines.map(l => ctx.measureText(l).width));
+                const cardW = textWidth + padX * 2;
+                const cardH = lines.length * 16 + padY * 2;
+                ctx.fillStyle = 'rgba(255,255,255,0.95)';
+                ctx.strokeStyle = 'rgba(15,23,42,0.2)';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.roundRect(cardX, cardY - cardH, cardW, cardH, 6);
+                ctx.fill();
+                ctx.stroke();
+                ctx.fillStyle = '#0f172a';
+                lines.forEach((l, idx) => {
+                    ctx.fillText(l, cardX + padX, cardY - cardH + padY + 12 + idx * 16);
+                });
+                ctx.restore();
+            }
+        }
         ctx.restore();
     }, [selections, isSelecting, selectionStart, selectionEnd, isCalibrating, calibrationStart, calibrationEnd, calibration, calibrationMeters, zoom, pan, shapes, isDrawing, drawingPoints, mousePosition, drawingMode, fillColor]);
 
@@ -1396,219 +1832,121 @@ export default function SimplePdfViewer() {
 
             <div className="container mx-auto px-6 py-4">
                 {/* Professional Compact Controls */}
-                <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-lg border border-white/20 p-4 mb-6">
-                    <div className="flex items-center justify-between flex-wrap gap-2">
-                        {/* Zoom Controls */}
-                        <div className="flex items-center">
-                            <button
-                                onClick={handleZoomOut}
-                                className="w-12 h-12 bg-white hover:bg-slate-100 rounded-l-xl border border-slate-200 transition-all duration-200 flex items-center justify-center shadow-md"
-                            >
-                                <svg className="w-6 h-6 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" />
-                                </svg>
-                            </button>
-                            <div className="flex-1 relative min-w-[150px]">
-                                <input
-                                    type="range"
-                                    min="25"
-                                    max="1000"
-                                    value={zoom}
-                                    onChange={handleZoomChange}
-                                    className="w-full h-3 bg-slate-200 appearance-none cursor-pointer slider"
-                                />
-                                <div className="absolute -top-8 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-3 py-1 rounded-lg text-sm font-medium">
-                                    {zoom}%
+                <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-lg border border-white/20 p-3 mb-6">
+                    {isCalibNameModalOpen && createPortal(
+                        <div className="fixed inset-0 z-[2147483647] flex items-center justify-center">
+                            <div className="absolute inset-0 bg-black/45" onClick={() => { setIsCalibNameModalOpen(false); setIsCalibrating(false); setIsCalibrationMode(false); setPendingCalibrationBase(null); }}></div>
+                            <div className="relative bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm p-4">
+                                <div className="text-sm font-semibold text-slate-800 mb-2">Save Calibration</div>
+                                <div className="text-xs text-slate-600 mb-3">Give a name for this calibration system.</div>
+                                <input value={pendingCalibrationName} onChange={(e) => setPendingCalibrationName(e.target.value)} className="w-full h-9 px-3 rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-600" placeholder="e.g. Ground Floor 1m" autoFocus />
+                                <div className="mt-4 flex justify-end gap-2">
+                                    <button onClick={() => { setIsCalibNameModalOpen(false); setIsCalibrating(false); setIsCalibrationMode(false); setPendingCalibrationBase(null); }} className="h-8 px-3 rounded-md border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 text-xs">Cancel</button>
+                                    <button onClick={() => { if (!pendingCalibrationBase) return; const name = (pendingCalibrationName || '').trim(); if (!name) return; const named = { name, ...pendingCalibrationBase } as NamedCalibration; setCalibrations(prev => { const arr = [...prev.filter(c => c.name !== name), named]; sessionStorage.setItem('calibrations', JSON.stringify(arr)); return arr; }); setActiveCalibrationName(name); setCalibration(pendingCalibrationBase); setIsCalibNameModalOpen(false); setIsCalibrating(false); setIsCalibrationMode(false); setPendingCalibrationBase(null); }} className="h-8 px-3 rounded-md bg-slate-800 text-white text-xs">Save</button>
                                 </div>
                             </div>
-                            <button
-                                onClick={handleZoomIn}
-                                className="w-12 h-12 bg-white hover:bg-slate-100 rounded-r-xl border-l-0 border border-slate-200 transition-all duration-200 flex items-center justify-center shadow-md"
-                            >
-                                <svg className="w-6 h-6 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                                </svg>
+                        </div>,
+                        document.body
+                    )}
+                    <div className="flex items-center justify-between gap-3">
+                        {/* Left: Zoom (compact) */}
+                        <div className="flex items-center gap-2">
+                            <button onClick={handleZoomOut} className="h-8 w-8 rounded-md border border-slate-200 bg-white hover:bg-slate-50 flex items-center justify-center">
+                                <span className="text-slate-700 text-lg leading-none">−</span>
                             </button>
+                            <input type="range" min="25" max="1000" value={zoom} onChange={handleZoomChange} className="w-40 h-2 accent-slate-700" />
+                            <div className="text-xs text-slate-600 w-10 text-right">{zoom}%</div>
+                            <button onClick={handleZoomIn} className="h-8 w-8 rounded-md border border-slate-200 bg-white hover:bg-slate-50 flex items-center justify-center">
+                                <span className="text-slate-700 text-lg leading-none">+</span>
+                            </button>
+                            <button onClick={zoomToFit} className="ml-2 h-8 px-2 rounded-md border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 text-xs">Fit</button>
+                            <button onClick={resetView} className="h-8 px-2 rounded-md border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 text-xs">Reset</button>
                         </div>
 
-                        {/* View Controls */}
-                        <div className="flex items-center">
-                            <button
-                                onClick={zoomToFit}
-                                className="px-3 py-2 bg-gradient-to-r from-green-500 to-emerald-500 text-white rounded-l-lg hover:from-green-600 hover:to-emerald-600 transition-all duration-200 text-xs font-medium shadow-md"
+                        {/* Right: Calibrate + Draw */}
+                        <div className="flex items-center gap-2">
+                            <select
+                                value={activeCalibrationName ?? ''}
+                                onChange={(e) => {
+                                    const v = e.target.value;
+                                    if (!v) {
+                                        setCalibration(null);
+                                        setActiveCalibrationName(null);
+                                        setIsCalibrationMode(false);
+                                        try { sessionStorage.removeItem('activeCalibration'); } catch { }
+                                        // clear selection real-area cache
+                                        setSelections(prev => prev.map(s => ({ ...s, areaInMeters: 0 })));
+                                        return;
+                                    }
+                                    if (v === '__new__') {
+                                        setIsCalibrationMode(true);
+                                        setActiveCalibrationName(null);
+                                        setCalibration(null);
+                                        return;
+                                    }
+                                    const found = calibrations.find(c => c.name === v);
+                                    if (found) {
+                                        setCalibration(found);
+                                        if (found.start && found.end) {
+                                            setCalibrationStart(found.start);
+                                            setCalibrationEnd(found.end);
+                                        }
+                                        setActiveCalibrationName(found.name);
+                                        setIsCalibrationMode(false);
+                                        setSelections(prev => prev.map(s => ({
+                                            ...s,
+                                            areaInMeters: s.area / (found.pixelsPerMeter * found.pixelsPerMeter)
+                                        })));
+                                    }
+                                }}
+                                className="h-8 px-2 rounded-md border border-slate-200 bg-white text-xs text-slate-700"
                             >
-                                Fit
-                            </button>
-                            <button
-                                onClick={resetView}
-                                className="px-3 py-2 bg-gradient-to-r from-slate-500 to-slate-600 text-white rounded-r-lg hover:from-slate-600 hover:to-slate-700 transition-all duration-200 text-xs font-medium shadow-md border-l border-slate-400"
-                            >
-                                Reset
-                            </button>
-                        </div>
-
-                        {/* Calibration */}
-                        <div className="flex items-center">
-                            <button
-                                onClick={() => setIsCalibrationMode(!isCalibrationMode)}
-                                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 shadow-md ${isCalibrationMode
-                                    ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
-                                    : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                    }`}
-                            >
-                                <div className="flex items-center space-x-1">
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                                    </svg>
-                                    <span>{isCalibrationMode ? 'Active' : 'Calibrate'}</span>
-                                </div>
-                            </button>
-                            {isCalibrationMode && (
-                                <div className="flex items-center ml-2">
-                                    <span className="text-sm text-slate-700">Ref:</span>
-                                    <input
-                                        type="number"
-                                        min="0.1"
-                                        step="0.1"
-                                        value={calibrationMeters}
-                                        onChange={(e) => setCalibrationMeters(parseFloat(e.target.value) || 1)}
-                                        className="w-20 px-3 py-2 border border-slate-300 rounded-lg text-center text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 ml-1"
-                                    />
-                                    <span className="text-sm text-slate-700 ml-1">m</span>
-                                </div>
-                            )}
-                        </div>
-
-                        {/* Shapes quick action */}
-                        <div className="flex items-center">
-                            {shapes.length > 0 && (
-                                <button
-                                    onClick={() => setShapes([])}
-                                    className="px-3 py-2 bg-gradient-to-r from-orange-500 to-red-500 text-white rounded-lg hover:from-orange-600 hover:to-red-600 transition-all duration-200 text-xs font-medium shadow-md"
-                                >
-                                    Clear Shapes ({shapes.length})
-                                </button>
-                            )}
-                        </div>
-
-                        {/* Draw Button (toggle to enable/disable drawing; when off you can pan) */}
-                        <div className="flex items-center">
-                            <button
-                                onClick={() => { handleModeChange('draw'); setDrawEnabled(prev => !prev); }}
-                                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all duration-200 shadow-md ${drawEnabled
-                                    ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700'
-                                    : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                    }`}
-                            >
-                                <div className="flex items-center space-x-1">
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-                                    </svg>
-                                    <span>{drawEnabled ? 'Draw On' : 'Draw Off'}</span>
-                                </div>
-                            </button>
-                            {selectedShapeId && (
-                                <button
-                                    onClick={deleteSelectedShape}
-                                    className="ml-2 px-3 py-2 text-xs font-medium rounded-lg bg-gradient-to-r from-red-500 to-pink-500 text-white hover:from-red-600 hover:to-pink-600 shadow-md"
-                                    title="Delete Selected Shape"
-                                >
+                                <option value="">No calibration</option>
+                                {calibrations.map(c => (
+                                    <option key={c.name} value={c.name}>{c.name}</option>
+                                ))}
+                                <option value="__new__">+ New calibration…</option>
+                            </select>
+                            {activeCalibrationName && (
+                                <button onClick={deleteActiveCalibration} title="Delete calibration" className="h-8 px-2 rounded-md border border-red-200 text-red-700 bg-white hover:bg-red-50 text-xs">
                                     Delete
                                 </button>
                             )}
+                            {/* Removed toggle; calibration is considered active when selected from dropdown */}
+                            {isCalibrationMode && (
+                                <div className="flex items-center gap-1 text-xs text-slate-700">
+                                    <span>Ref</span>
+                                    <input type="number" min="0.01" step="0.01" value={calibrationMeters} onChange={(e) => setCalibrationMeters(parseFloat(e.target.value) || 1)} className="w-20 h-8 px-2 rounded-md border border-slate-200 text-right" />
+                                    <select value={calibrationUnit} onChange={(e) => setCalibrationUnit(e.target.value as 'm' | 'cm')} className="h-8 px-2 rounded-md border border-slate-200 bg-white text-xs">
+                                        <option value="m">m</option>
+                                        <option value="cm">cm</option>
+                                    </select>
+                                </div>
+                            )}
+                            <button onClick={() => { handleModeChange('draw'); setDrawEnabled(prev => !prev); }} className={`h-8 px-3 rounded-md text-xs ${drawEnabled ? 'bg-blue-600 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>
+                                {drawEnabled ? 'Draw On' : 'Draw Off'}
+                            </button>
+                            {selectedShapeId && (
+                                <button onClick={deleteSelectedShape} className="h-8 px-3 rounded-md text-xs bg-red-600 text-white">Delete</button>
+                            )}
                         </div>
-
-                        {/* Drawing Tools (only show in draw mode) */}
-                        {currentMode === 'draw' && drawEnabled && (
-                            <div className="flex items-center">
-                                <button
-                                    onClick={() => setDrawingMode(drawingMode === 'line' ? null : 'line')}
-                                    className={`px-3 py-2 rounded-l-lg text-xs font-medium transition-all duration-200 shadow-md ${drawingMode === 'line'
-                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
-                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                        }`}
-                                >
-                                    <div className="flex items-center space-x-1">
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14" />
-                                        </svg>
-                                        <span>Line</span>
-                                    </div>
-                                </button>
-                                <button
-                                    onClick={() => setDrawingMode(drawingMode === 'circle' ? null : 'circle')}
-                                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'circle'
-                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
-                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                        }`}
-                                >
-                                    <div className="flex items-center space-x-1">
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                        </svg>
-                                        <span>Circle</span>
-                                    </div>
-                                </button>
-                                <button
-                                    onClick={() => setDrawingMode(drawingMode === 'rectangle' ? null : 'rectangle')}
-                                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'rectangle'
-                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
-                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                        }`}
-                                >
-                                    <div className="flex items-center space-x-1">
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
-                                        </svg>
-                                        <span>Rect</span>
-                                    </div>
-                                </button>
-                                <button
-                                    onClick={() => setDrawingMode(drawingMode === 'polygon' ? null : 'polygon')}
-                                    className={`px-3 py-2 text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'polygon'
-                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
-                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                        }`}
-                                >
-                                    <div className="flex items-center space-x-1">
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                                        </svg>
-                                        <span>Poly</span>
-                                    </div>
-                                </button>
-                                <button
-                                    onClick={() => setDrawingMode(drawingMode === 'fill' ? null : 'fill')}
-                                    className={`px-3 py-2 rounded-r-lg text-xs font-medium transition-all duration-200 shadow-md border-l border-slate-200 ${drawingMode === 'fill'
-                                        ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white hover:from-green-700 hover:to-emerald-700'
-                                        : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200'
-                                        }`}
-                                >
-                                    <div className="flex items-center space-x-1">
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zM21 5a2 2 0 00-2-2h-4a2 2 0 00-2 2v12a4 4 0 004 4h4a2 2 0 002-2V5z" />
-                                        </svg>
-                                        <span>Fill</span>
-                                    </div>
-                                </button>
-                                {drawingMode === 'fill' && (
-                                    <div className="flex items-center ml-1">
-                                        <input
-                                            type="color"
-                                            value={fillColor}
-                                            onChange={(e) => setFillColor(e.target.value)}
-                                            className="w-6 h-6 rounded border border-slate-300 cursor-pointer"
-                                            title="Fill Color"
-                                        />
-                                    </div>
-                                )}
-                            </div>
-                        )}
-
-                        {/* Curve mode toggle removed; curve is always on for polygons */}
-
-                        {/* Status panel removed as requested */}
                     </div>
+                    {currentMode === 'draw' && drawEnabled && (
+                        <div className="mt-3 flex items-center gap-1 justify-end">
+                            <button onClick={() => setDrawingMode(drawingMode === 'line' ? null : 'line')} className={`h-8 px-2 rounded-l-md text-xs ${drawingMode === 'line' ? 'bg-slate-800 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>Line</button>
+                            <button onClick={() => setDrawingMode(drawingMode === 'circle' ? null : 'circle')} className={`h-8 px-2 text-xs ${drawingMode === 'circle' ? 'bg-slate-800 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>Circle</button>
+                            <button onClick={() => setDrawingMode(drawingMode === 'rectangle' ? null : 'rectangle')} className={`h-8 px-2 text-xs ${drawingMode === 'rectangle' ? 'bg-slate-800 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>Rect</button>
+                            <button onClick={() => setDrawingMode(drawingMode === 'polygon' ? null : 'polygon')} className={`h-8 px-2 text-xs ${drawingMode === 'polygon' ? 'bg-slate-800 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>Poly</button>
+                            <button onClick={() => setDrawingMode(drawingMode === 'fill' ? null : 'fill')} className={`h-8 px-2 rounded-r-md text-xs ${drawingMode === 'fill' ? 'bg-slate-800 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>Fill</button>
+                            {drawingMode === 'fill' && (
+                                <input type="color" value={fillColor} onChange={(e) => setFillColor(e.target.value)} className="ml-1 h-8 w-8 rounded border border-slate-200" />
+                            )}
+                        </div>
+                    )}
+
+                    {/* Curve mode toggle removed; curve is always on for polygons */}
+
+                    {/* Status panel removed as requested */}
                 </div>
 
                 {/* Enhanced PDF Viewer */}
