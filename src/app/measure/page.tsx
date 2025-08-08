@@ -1965,7 +1965,7 @@ export default function SimplePdfViewer() {
                                 </div>
                             )}
                             <button onClick={() => { handleModeChange('draw'); setDrawEnabled(prev => !prev); }} className={`h-8 px-3 rounded-md text-xs ${drawEnabled ? 'bg-blue-600 text-white' : 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50'}`}>
-                                {drawEnabled ? 'Draw On' : 'Draw Off'}
+                                Draw
                             </button>
                             {selectedShapeId && (
                                 <button onClick={() => { setDeleteTarget('shape'); setIsDeleteConfirmOpen(true); }} className="h-8 px-3 rounded-md text-xs bg-red-600 text-white">Delete</button>
