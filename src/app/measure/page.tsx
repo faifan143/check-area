@@ -85,6 +85,23 @@ export default function SimplePdfViewer() {
     const [pendingCalibrationName, setPendingCalibrationName] = useState('');
     const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
     const [deleteTarget, setDeleteTarget] = useState<'shape' | 'calibration' | null>(null);
+    const [isCalibListOpen, setIsCalibListOpen] = useState(false);
+    const [calibrationToDeleteName, setCalibrationToDeleteName] = useState<string | null>(null);
+
+    const deleteCalibrationByName = useCallback((name: string) => {
+        setCalibrations(prev => {
+            const arr = prev.filter(c => c.name !== name);
+            try { sessionStorage.setItem('calibrations', JSON.stringify(arr)); } catch { }
+            return arr;
+        });
+        if (activeCalibrationName === name) {
+            setActiveCalibrationName(null);
+            setCalibration(null);
+            try { sessionStorage.removeItem('activeCalibration'); } catch { }
+            setSelections(prev => prev.map(s => ({ ...s, areaInMeters: 0 })));
+            setIsCalibrationMode(false);
+        }
+    }, [activeCalibrationName]);
 
     const deleteActiveCalibration = useCallback(() => {
         if (!activeCalibrationName) return;
@@ -734,6 +751,34 @@ export default function SimplePdfViewer() {
     };
 
     const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+        // Prioritize calibration mode so nothing else intercepts the click
+        if (isCalibrationMode) {
+            const coords = getPdfCoordinates(e);
+            if (!isCalibrating) {
+                setIsCalibrating(true);
+                setCalibrationStart(coords);
+                setCalibrationEnd(coords);
+            } else {
+                const length = Math.hypot(coords.x - calibrationStart.x, coords.y - calibrationStart.y);
+                if (length > 10) {
+                    const refMeters = calibrationUnit === 'm' ? calibrationMeters : (calibrationMeters / 100);
+                    const base: Calibration = {
+                        pixelsPerMeter: length / refMeters,
+                        referenceLength: length,
+                        referenceMeters: refMeters,
+                        start: { x: calibrationStart.x, y: calibrationStart.y },
+                        end: { x: coords.x, y: coords.y }
+                    };
+                    setPendingCalibrationBase(base);
+                    setPendingCalibrationName('');
+                    setIsCalibNameModalOpen(true);
+                }
+                // Freeze at this end point until user confirms
+                setIsCalibrating(false);
+            }
+            return;
+        }
+
         // Selection interactions (move/resize/curve) like home page
         {
             const rect = containerRef.current?.getBoundingClientRect();
@@ -841,33 +886,7 @@ export default function SimplePdfViewer() {
             return;
         }
 
-        if (isCalibrationMode) {
-            // Two-click calibration with naming dialog
-            const coords = getPdfCoordinates(e);
-            if (!isCalibrating) {
-                setIsCalibrating(true);
-                setCalibrationStart(coords);
-                setCalibrationEnd(coords);
-            } else {
-                const length = Math.hypot(coords.x - calibrationStart.x, coords.y - calibrationStart.y);
-                if (length > 10) {
-                    // Convert entered reference to meters
-                    const refMeters = calibrationUnit === 'm' ? calibrationMeters : (calibrationMeters / 100);
-                    const base: Calibration = {
-                        pixelsPerMeter: length / refMeters,
-                        referenceLength: length,
-                        referenceMeters: refMeters,
-                        start: { x: calibrationStart.x, y: calibrationStart.y },
-                        end: { x: coords.x, y: coords.y }
-                    };
-                    setPendingCalibrationBase(base);
-                    setPendingCalibrationName('');
-                    setIsCalibNameModalOpen(true);
-                }
-                // Freeze the preview at this end point until user confirms
-                setIsCalibrating(false);
-            }
-        } else if (isSelectionMode) {
+        if (isSelectionMode) {
             // Start selection
             const coords = getPdfCoordinates(e);
             setIsSelecting(true);
@@ -1837,16 +1856,16 @@ export default function SimplePdfViewer() {
 
             <div className="container mx-auto px-6 py-2">
                 {/* Professional Compact Controls */}
-                <div className="bg-white/80 backdrop-blur-sm rounded-t-xl shadow-lg border border-white/20 p-3 ">
+                <div className="bg-white/80 backdrop-blur-sm rounded-t-xl shadow-lg border border-white/20 p-3 relative z-[200] ">
                     {isDeleteConfirmOpen && createPortal(
                         <div className="fixed inset-0 z-[2147483647] flex items-center justify-center">
                             <div className="absolute inset-0 bg-black/45" onClick={() => { setIsDeleteConfirmOpen(false); setDeleteTarget(null); }}></div>
                             <div className="relative bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm p-4">
                                 <div className="text-sm font-semibold text-slate-800 mb-2">Confirm delete</div>
-                                <div className="text-xs text-slate-600 mb-3">Are you sure you want to delete this {deleteTarget === 'shape' ? 'shape' : 'calibration'}?</div>
+                                <div className="text-xs text-slate-600 mb-3">Are you sure you want to delete this {deleteTarget === 'shape' ? 'shape' : `calibration${calibrationToDeleteName ? ` (${calibrationToDeleteName})` : ''}`}?</div>
                                 <div className="mt-2 flex justify-end gap-2">
                                     <button onClick={() => { setIsDeleteConfirmOpen(false); setDeleteTarget(null); }} className="h-8 px-3 rounded-md border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 text-xs">Cancel</button>
-                                    <button onClick={() => { if (deleteTarget === 'shape') { deleteSelectedShape(); } else if (deleteTarget === 'calibration') { deleteActiveCalibration(); } setIsDeleteConfirmOpen(false); setDeleteTarget(null); }} className="h-8 px-3 rounded-md bg-red-600 text-white text-xs">Delete</button>
+                                    <button onClick={() => { if (deleteTarget === 'shape') { deleteSelectedShape(); } else if (deleteTarget === 'calibration') { if (calibrationToDeleteName) deleteCalibrationByName(calibrationToDeleteName); } setIsDeleteConfirmOpen(false); setDeleteTarget(null); setCalibrationToDeleteName(null); }} className="h-8 px-3 rounded-md bg-red-600 text-white text-xs">Delete</button>
                                 </div>
                             </div>
                         </div>, document.body)}
@@ -1882,53 +1901,30 @@ export default function SimplePdfViewer() {
 
                         {/* Right: Calibrate + Draw */}
                         <div className="flex items-center gap-2">
-                            <select
-                                value={activeCalibrationName ?? ''}
-                                onChange={(e) => {
-                                    const v = e.target.value;
-                                    if (!v) {
-                                        setCalibration(null);
-                                        setActiveCalibrationName(null);
-                                        setIsCalibrationMode(false);
-                                        try { sessionStorage.removeItem('activeCalibration'); } catch { }
-                                        // clear selection real-area cache
-                                        setSelections(prev => prev.map(s => ({ ...s, areaInMeters: 0 })));
-                                        return;
-                                    }
-                                    if (v === '__new__') {
-                                        setIsCalibrationMode(true);
-                                        setActiveCalibrationName(null);
-                                        setCalibration(null);
-                                        return;
-                                    }
-                                    const found = calibrations.find(c => c.name === v);
-                                    if (found) {
-                                        setCalibration(found);
-                                        if (found.start && found.end) {
-                                            setCalibrationStart(found.start);
-                                            setCalibrationEnd(found.end);
-                                        }
-                                        setActiveCalibrationName(found.name);
-                                        setIsCalibrationMode(false);
-                                        setSelections(prev => prev.map(s => ({
-                                            ...s,
-                                            areaInMeters: s.area / (found.pixelsPerMeter * found.pixelsPerMeter)
-                                        })));
-                                    }
-                                }}
-                                className="h-8 px-2 rounded-md border border-slate-200 bg-white text-xs text-slate-700"
-                            >
-                                <option value="">No calibration</option>
-                                {calibrations.map(c => (
-                                    <option key={c.name} value={c.name}>{c.name}</option>
-                                ))}
-                                <option value="__new__">+ New calibration…</option>
-                            </select>
-                            {activeCalibrationName && (
-                                <button onClick={() => { setDeleteTarget('calibration'); setIsDeleteConfirmOpen(true); }} title="Delete calibration" className="h-8 px-2 rounded-md border border-red-200 text-red-700 bg-white hover:bg-red-50 text-xs">
-                                    Delete
+                            <div className="relative">
+                                <button onClick={() => setIsCalibListOpen(prev => !prev)} className="h-8 px-3 rounded-md border border-slate-200 bg-white text-xs text-slate-700 min-w-[150px] flex items-center justify-between">
+                                    <span className="truncate">{activeCalibrationName ?? 'No calibration'}</span>
+                                    <svg className="w-3 h-3 ml-2" viewBox="0 0 20 20" fill="currentColor"><path d="M5.23 7.21a.75.75 0 011.06.02L10 11.188l3.71-3.957a.75.75 0 111.08 1.04l-4.24 4.52a.75.75 0 01-1.08 0l-4.24-4.52a.75.75 0 01.02-1.06z" /></svg>
                                 </button>
-                            )}
+                                {isCalibListOpen && (
+                                    <div className="absolute right-0 mt-1 z-[2147483000] w-64 bg-white border border-slate-200 rounded-md shadow-lg overflow-hidden">
+                                        <div className="max-h-64 overflow-auto">
+                                            <div className="px-2 py-1 text-[10px] text-slate-500">Calibrations</div>
+                                            <button className="w-full text-left px-3 py-2 text-xs hover:bg-slate-50 flex items-center justify-between" onClick={() => { setIsCalibListOpen(false); setCalibration(null); setActiveCalibrationName(null); setIsCalibrationMode(false); try { sessionStorage.removeItem('activeCalibration'); } catch { } setSelections(prev => prev.map(s => ({ ...s, areaInMeters: 0 }))); }}>No calibration</button>
+                                            {calibrations.map(c => (
+                                                <div key={c.name} className="flex items-center justify-between px-3 py-2 text-xs hover:bg-slate-50">
+                                                    <button className="text-left truncate" onClick={() => { setIsCalibListOpen(false); setActiveCalibrationName(c.name); setCalibration(c); if (c.start && c.end) { setCalibrationStart(c.start); setCalibrationEnd(c.end); } setIsCalibrationMode(false); setIsCalibrating(false); try { sessionStorage.setItem('activeCalibration', c.name); } catch { } setSelections(prev => prev.map(s => ({ ...s, areaInMeters: s.area / (c.pixelsPerMeter * c.pixelsPerMeter) }))); }}>{c.name}</button>
+                                                    <button title="Delete" onClick={() => { setIsCalibListOpen(false); setCalibrationToDeleteName(c.name); setDeleteTarget('calibration'); setIsDeleteConfirmOpen(true); }} className="text-red-600 hover:text-red-700 p-1">
+                                                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                                    </button>
+                                                </div>
+                                            ))}
+                                            <button className="w-full text-left px-3 py-2 text-xs bg-slate-50 hover:bg-slate-100" onClick={() => { setIsCalibListOpen(false); setIsCalibrationMode(true); setIsCalibrating(false); setActiveCalibrationName(null); setCalibration(null); }}>+ New calibration…</button>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
                             {/* Removed toggle; calibration is considered active when selected from dropdown */}
                             {isCalibrationMode && (
                                 <div className="flex items-center gap-1 text-xs text-slate-700">
