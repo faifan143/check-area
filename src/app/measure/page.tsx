@@ -87,6 +87,7 @@ export default function SimplePdfViewer() {
     const [deleteTarget, setDeleteTarget] = useState<'shape' | 'calibration' | null>(null);
     const [isCalibListOpen, setIsCalibListOpen] = useState(false);
     const [calibrationToDeleteName, setCalibrationToDeleteName] = useState<string | null>(null);
+    const calibMenuRef = useRef<HTMLDivElement | null>(null);
 
     const deleteCalibrationByName = useCallback((name: string) => {
         setCalibrations(prev => {
@@ -102,6 +103,29 @@ export default function SimplePdfViewer() {
             setIsCalibrationMode(false);
         }
     }, [activeCalibrationName]);
+
+    // Close calibration dropdown when clicking outside or pressing Escape
+    useEffect(() => {
+        if (!isCalibListOpen) return;
+        const handleGlobalPointer = (e: MouseEvent | TouchEvent) => {
+            if (!calibMenuRef.current) return;
+            const target = e.target as Node | null;
+            if (target && !calibMenuRef.current.contains(target)) {
+                setIsCalibListOpen(false);
+            }
+        };
+        const handleKey = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setIsCalibListOpen(false);
+        };
+        document.addEventListener('mousedown', handleGlobalPointer, true);
+        document.addEventListener('touchstart', handleGlobalPointer, true);
+        document.addEventListener('keydown', handleKey);
+        return () => {
+            document.removeEventListener('mousedown', handleGlobalPointer, true);
+            document.removeEventListener('touchstart', handleGlobalPointer, true);
+            document.removeEventListener('keydown', handleKey);
+        };
+    }, [isCalibListOpen]);
 
     const deleteActiveCalibration = useCallback(() => {
         if (!activeCalibrationName) return;
@@ -1901,7 +1925,7 @@ export default function SimplePdfViewer() {
 
                         {/* Right: Calibrate + Draw */}
                         <div className="flex items-center gap-2">
-                            <div className="relative">
+                            <div className="relative" ref={calibMenuRef}>
                                 <button onClick={() => setIsCalibListOpen(prev => !prev)} className="h-8 px-3 rounded-md border border-slate-200 bg-white text-xs text-slate-700 min-w-[150px] flex items-center justify-between">
                                     <span className="truncate">{activeCalibrationName ?? 'No calibration'}</span>
                                     <svg className="w-3 h-3 ml-2" viewBox="0 0 20 20" fill="currentColor"><path d="M5.23 7.21a.75.75 0 011.06.02L10 11.188l3.71-3.957a.75.75 0 111.08 1.04l-4.24 4.52a.75.75 0 01-1.08 0l-4.24-4.52a.75.75 0 01.02-1.06z" /></svg>
@@ -1961,9 +1985,6 @@ export default function SimplePdfViewer() {
                         </div>
                     )}
 
-                    {/* Curve mode toggle removed; curve is always on for polygons */}
-
-                    {/* Status panel removed as requested */}
                 </div>
 
                 {/* Enhanced PDF Viewer */}
