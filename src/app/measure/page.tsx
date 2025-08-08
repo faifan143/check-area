@@ -1912,9 +1912,13 @@ export default function SimplePdfViewer() {
                                             <div className="px-2 py-1 text-[10px] text-slate-500">Calibrations</div>
                                             <button className="w-full text-left px-3 py-2 text-xs hover:bg-slate-50 flex items-center justify-between" onClick={() => { setIsCalibListOpen(false); setCalibration(null); setActiveCalibrationName(null); setIsCalibrationMode(false); try { sessionStorage.removeItem('activeCalibration'); } catch { } setSelections(prev => prev.map(s => ({ ...s, areaInMeters: 0 }))); }}>No calibration</button>
                                             {calibrations.map(c => (
-                                                <div key={c.name} className="flex items-center justify-between px-3 py-2 text-xs hover:bg-slate-50">
-                                                    <button className="text-left truncate" onClick={() => { setIsCalibListOpen(false); setActiveCalibrationName(c.name); setCalibration(c); if (c.start && c.end) { setCalibrationStart(c.start); setCalibrationEnd(c.end); } setIsCalibrationMode(false); setIsCalibrating(false); try { sessionStorage.setItem('activeCalibration', c.name); } catch { } setSelections(prev => prev.map(s => ({ ...s, areaInMeters: s.area / (c.pixelsPerMeter * c.pixelsPerMeter) }))); }}>{c.name}</button>
-                                                    <button title="Delete" onClick={() => { setIsCalibListOpen(false); setCalibrationToDeleteName(c.name); setDeleteTarget('calibration'); setIsDeleteConfirmOpen(true); }} className="text-red-600 hover:text-red-700 p-1">
+                                                <div
+                                                    key={c.name}
+                                                    className="flex items-center justify-between px-3 py-2 text-xs hover:bg-slate-50 cursor-pointer"
+                                                    onClick={() => { setIsCalibListOpen(false); setActiveCalibrationName(c.name); setCalibration(c); if (c.start && c.end) { setCalibrationStart(c.start); setCalibrationEnd(c.end); } setIsCalibrationMode(false); setIsCalibrating(false); try { sessionStorage.setItem('activeCalibration', c.name); } catch { } setSelections(prev => prev.map(s => ({ ...s, areaInMeters: s.area / (c.pixelsPerMeter * c.pixelsPerMeter) }))); }}
+                                                >
+                                                    <span className="text-left truncate">{c.name}</span>
+                                                    <button title="Delete" onClick={(e) => { e.stopPropagation(); setIsCalibListOpen(false); setCalibrationToDeleteName(c.name); setDeleteTarget('calibration'); setIsDeleteConfirmOpen(true); }} className="text-red-600 hover:text-red-700 p-1">
                                                         <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                                                     </button>
                                                 </div>
@@ -1971,7 +1975,7 @@ export default function SimplePdfViewer() {
                             className="relative overflow-auto bg-gradient-to-br from-slate-100 to-slate-200"
                             style={{
                                 width: '100%',
-                                height: '80vh',
+                                maxHeight: '80vh',
                                 cursor: hoverCursor
                                     ? hoverCursor
                                     : isCalibrationMode
