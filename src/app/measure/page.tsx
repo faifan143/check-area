@@ -1835,9 +1835,9 @@ export default function SimplePdfViewer() {
                 </div>
             </header>
 
-            <div className="container mx-auto px-6 py-4">
+            <div className="container mx-auto px-6 py-2">
                 {/* Professional Compact Controls */}
-                <div className="bg-white/80 backdrop-blur-sm rounded-xl shadow-lg border border-white/20 p-3 mb-6">
+                <div className="bg-white/80 backdrop-blur-sm rounded-t-xl shadow-lg border border-white/20 p-3 ">
                     {isDeleteConfirmOpen && createPortal(
                         <div className="fixed inset-0 z-[2147483647] flex items-center justify-center">
                             <div className="absolute inset-0 bg-black/45" onClick={() => { setIsDeleteConfirmOpen(false); setDeleteTarget(null); }}></div>
@@ -1968,51 +1968,14 @@ export default function SimplePdfViewer() {
 
                 {/* Enhanced PDF Viewer */}
                 {file && (
-                    <div className="bg-white/90 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 overflow-hidden mb-8">
-                        <div className="p-6 border-b border-slate-200/60 bg-gradient-to-r from-slate-50 to-blue-50">
-                            <div className="flex items-center justify-between">
-                                <div className="flex items-center space-x-3">
-                                    <div className="w-10 h-10 bg-gradient-to-br from-red-500 to-red-600 rounded-lg flex items-center justify-center">
-                                        <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                                        </svg>
-                                    </div>
-                                    <div>
-                                        <h3 className="text-lg font-bold text-slate-800">{file.name}</h3>
-                                        <p className="text-sm text-slate-600">Ready for measurement</p>
-                                    </div>
-                                </div>
-
-                                {/* Quick Actions */}
-                                <div className="flex items-center space-x-3">
-                                    {isCalibrationMode && (
-                                        <div className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm font-semibold flex items-center space-x-1">
-                                            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                                            <span>Calibration Mode</span>
-                                        </div>
-                                    )}
-                                    {isSelectionMode && (
-                                        <div className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-semibold flex items-center space-x-1">
-                                            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                                            <span>Selection Mode</span>
-                                        </div>
-                                    )}
-                                    {!isCalibrationMode && !isSelectionMode && (
-                                        <div className="px-3 py-1 bg-slate-100 text-slate-700 rounded-full text-sm font-semibold flex items-center space-x-1">
-                                            <div className="w-2 h-2 bg-slate-500 rounded-full"></div>
-                                            <span>Navigation Mode</span>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        </div>
+                    <div className="bg-white/90 backdrop-blur-sm rounded-b-2xl shadow-xl border border-white/20 overflow-hidden mb-8">
 
                         <div
                             ref={containerRef}
-                            className="relative overflow-hidden bg-gradient-to-br from-slate-100 to-slate-200"
+                            className="relative overflow-auto bg-gradient-to-br from-slate-100 to-slate-200"
                             style={{
                                 width: '100%',
-                                height: '700px',
+                                height: '80vh',
                                 cursor: hoverCursor
                                     ? hoverCursor
                                     : isCalibrationMode
